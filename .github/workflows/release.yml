@@ -1,0 +1,63 @@
+name: Release (Windows .exe)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path 'requirements.txt') { pip install -r requirements.txt }
+          pip install pyinstaller
+
+      - name: Build .exe with PyInstaller
+        shell: pwsh
+        run: |
+          # Build args array and include fonts only if the folder exists
+          $args = @('--onefile','--noconsole','--name','PicCull')
+          if (Test-Path 'fonts') {
+            Write-Host 'Including fonts/ in build (optional).'
+            $args += @('--add-data','fonts;fonts')
+          } else {
+            Write-Host 'fonts/ directory not found; app will fall back to system fonts.' -ForegroundColor Yellow
+          }
+          $args += 'piccull.py'
+          pyinstaller @args
+
+      - name: Rename artifact
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $name = "PicCull-$tag-win64.exe"
+          Move-Item -Force "dist/PicCull.exe" $name
+          echo "ARTIFACT_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARTIFACT_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
