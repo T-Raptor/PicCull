@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 try:
 	from PIL import Image, ImageTk, ImageOps
@@ -157,11 +157,13 @@ class PicCullApp(tk.Tk):
 		self.canvas.pack(fill=tk.BOTH, expand=True)
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
 
-		# Status bar
+		# Status bar (counter + text)
 		bottom = ttk.Frame(self, style="Panel.TFrame")
 		bottom.pack(side=tk.BOTTOM, fill=tk.X)
-		self.status = ttk.Label(bottom, text="Pick a folder to begin", style="Muted.TLabel")
-		self.status.pack(side=tk.LEFT, padx=8, pady=6)
+		self.counter_label = ttk.Label(bottom, text="", style="Muted.TLabel")
+		self.counter_label.pack(side=tk.LEFT, padx=(8, 0), pady=6)
+		self.status_label = ttk.Label(bottom, text="Pick a folder to begin", style="Muted.TLabel")
+		self.status_label.pack(side=tk.LEFT, padx=8, pady=6)
 
 		self._update_controls()
 
@@ -198,7 +200,18 @@ class PicCullApp(tk.Tk):
 			text = f"{self.index + 1}/{len(self.images)} — {im_path.name}"
 		if extra:
 			text = f"{text}  |  {extra}"
-		self.status.configure(text=text)
+		# Update counter and status parts
+		if self.index == -1 or not self.images:
+			self.counter_label.configure(text="")
+			self.status_label.configure(text=text)
+		else:
+			im_path = self.images[self.index]
+			counter = f"{self.index + 1}/{len(self.images)}"
+			info = f" — {im_path.name}"
+			if extra:
+				info = f"{info}  |  {extra}"
+			self.counter_label.configure(text=counter)
+			self.status_label.configure(text=info)
 
 	def _update_controls(self) -> None:
 		has_images = bool(self.images)
@@ -211,8 +224,45 @@ class PicCullApp(tk.Tk):
 		self.btn_delete.configure(state=(tk.NORMAL if has_images else tk.DISABLED))
 		self.btn_undo.configure(state=(tk.NORMAL if self._last_deleted else tk.DISABLED))
 
+		# Bind/unbind counter click for jump
+		try:
+			self.counter_label.unbind("<Button-1>")
+			self.counter_label.unbind("<Enter>")
+			self.counter_label.unbind("<Leave>")
+		except Exception:
+			pass
+		if has_images:
+			self.counter_label.configure(cursor="hand2")
+			self.counter_label.bind("<Button-1>", lambda e: self._on_counter_click())
+			self.counter_label.bind("<Enter>", lambda e: self.counter_label.configure(cursor="hand2"))
+			self.counter_label.bind("<Leave>", lambda e: self.counter_label.configure(cursor=""))
+		else:
+			self.counter_label.configure(cursor="")
+
 		# Update canvas arrows
 		self._draw_arrows()
+
+	def _on_counter_click(self) -> None:
+		if not self.images:
+			return
+		n = len(self.images)
+		current = self.index + 1 if self.index >= 0 else 1
+		val = simpledialog.askinteger(
+			"Go to image",
+			f"Enter image number (1-{n}):",
+			minvalue=1,
+			maxvalue=n,
+			initialvalue=current,
+			parent=self,
+		)
+		if val is None:
+			return
+		target = int(val) - 1
+		if 0 <= target < n and target != self.index:
+			self.index = target
+			self._set_status()
+			self._show_current()
+			self._update_controls()
 
 	def prev_image(self) -> None:
 		if not self.images or self.index <= 0:
