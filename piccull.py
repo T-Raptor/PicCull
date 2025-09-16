@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 
 try:
 	from PIL import Image, ImageTk, ImageOps
@@ -65,8 +66,8 @@ class PicCullApp(tk.Tk):
 			"border": "#2A2A2A",
 		}
 
-		# Use a monospaced font available on Windows
-		self.font_family = "Consolas" if sys.platform.startswith("win") else "Menlo"
+		# Fonts: prefer JetBrains Mono (bundled or system), then fallbacks
+		self.font_family = self._pick_font_family()
 		self.base_font = (self.font_family, 11)
 		self.small_font = (self.font_family, 10)
 
@@ -107,6 +108,8 @@ class PicCullApp(tk.Tk):
 		# UI
 		self._build_ui()
 		self._bind_keys()
+		# Track any Windows private fonts we load to remove on exit
+		self._win_private_fonts: list[Path] = []
 
 	def _setup_style(self) -> None:
 		style = ttk.Style(self)
@@ -213,6 +216,60 @@ class PicCullApp(tk.Tk):
 
 		# Ensure we clear ephemeral caches on close
 		self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+	def _resource_path(self, *parts: str) -> Path:
+		"""Return absolute path to a bundled resource (PyInstaller/_MEIPASS aware)."""
+		base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))  # type: ignore[attr-defined]
+		return base.joinpath(*parts)
+
+	def _pick_font_family(self) -> str:
+		"""Choose monospaced font, optionally loading a bundled TTF.
+		Order:
+		1) Try to load fonts/JetBrainsMono-Regular.ttf via tkextrafont (cross-platform C-extension).
+		2) Use system-installed "JetBrains Mono" if present.
+		3) On Windows, fall back to AddFontResourceEx (private, process-only) if tkextrafont not available.
+		4) Fallback: Consolas (Windows) / Menlo (macOS) / Courier New / TkFixedFont.
+		"""
+		preferred = "JetBrains Mono"
+		# Attempt to load bundled TTF if available and extension installed
+		try:
+			fonts_dir = self._resource_path("fonts")
+			bundle = fonts_dir / "JetBrainsMono-Regular.ttf"
+			if bundle.exists():
+				try:
+					from tkextrafont import Font as ExtraFont  # type: ignore
+					ExtraFont(file=str(bundle), family=preferred)
+				except Exception:
+					# As a Windows-specific fallback, try adding a private font resource
+					if sys.platform.startswith("win"):
+						try:
+							import ctypes
+							FR_PRIVATE = 0x10
+							res = ctypes.windll.gdi32.AddFontResourceExW(str(bundle), FR_PRIVATE, 0)
+							if res > 0:
+								self._win_private_fonts.append(bundle)
+						except Exception:
+							pass
+		except Exception:
+			pass
+		# Inspect available families after optional load
+		try:
+			families = set(tkfont.families(self))
+		except Exception:
+			families = set()
+		if preferred in families:
+			return preferred
+		# Fallbacks by platform
+		if sys.platform.startswith("win"):
+			if "Consolas" in families:
+				return "Consolas"
+		else:
+			if "Menlo" in families:
+				return "Menlo"
+		# Cross-platform fallbacks
+		if "Courier New" in families:
+			return "Courier New"
+		return "TkFixedFont"
 
 	def _bind_keys(self) -> None:
 		self.bind("<Escape>", lambda e: self.destroy())
@@ -920,6 +977,17 @@ class PicCullApp(tk.Tk):
 			self.thumb_cache.clear()
 		except Exception:
 			pass
+		# Remove any private fonts we added on Windows
+		if sys.platform.startswith("win") and self._win_private_fonts:
+			try:
+				import ctypes
+				for p in self._win_private_fonts:
+					try:
+						ctypes.windll.gdi32.RemoveFontResourceExW(str(p), 0x10, 0)
+					except Exception:
+						pass
+			except Exception:
+				pass
 		self.destroy()
 
 	def _move_selection_up(self) -> None:
