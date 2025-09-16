@@ -91,6 +91,7 @@ class PicCullApp(tk.Tk):
 		# Thumbnails
 		self.thumb_size: int = 200
 		self.thumb_size_var = tk.IntVar(value=self.thumb_size)
+		self.thumb_step: int = 48  # large increments to avoid frequent rebuilds
 		# Cache thumbnails for the session keyed by (path, size)
 		self.thumb_cache: dict[tuple[Path, int], ImageTk.PhotoImage] = {}
 		self._gallery_tiles: list[tk.Frame] = []
@@ -166,21 +167,23 @@ class PicCullApp(tk.Tk):
 		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo, self.btn_mode):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
-		# Thumbnail size control (adjustable during session)
-		sep = ttk.Frame(top, style="Panel.TFrame")
-		sep.pack(side=tk.LEFT, padx=8)
-		self.thumb_label = ttk.Label(top, text=f"Thumb {self.thumb_size}px", style="Muted.TLabel")
-		self.thumb_label.pack(side=tk.LEFT, padx=(8, 4))
+		# Thumbnail size control (Gallery-only panel)
+		self.thumb_panel = ttk.Frame(top, style="Panel.TFrame")
+		self.thumb_label = ttk.Label(self.thumb_panel, text=f"Thumb {self.thumb_size}px", style="Muted.TLabel")
+		self.thumb_label.pack(side=tk.LEFT, padx=(8, 6), pady=8)
 		self.thumb_scale = ttk.Scale(
-			top,
+			self.thumb_panel,
 			from_=96,
 			to=384,
 			orient=tk.HORIZONTAL,
 			value=self.thumb_size,
 			length=160,
-			command=lambda v: self._on_thumb_size_change(float(v)),
+			command=lambda v: self._on_thumb_scale_move(float(v)),
 		)
-		self.thumb_scale.pack(side=tk.LEFT, padx=(0, 8))
+		self.thumb_scale.pack(side=tk.LEFT, padx=(0, 8), pady=8)
+		# Apply on mouse/key release only
+		self.thumb_scale.bind("<ButtonRelease-1>", self._apply_thumb_size_from_scale)
+		self.thumb_scale.bind("<KeyRelease>", self._apply_thumb_size_from_scale)
 
 		# Center view container
 		self.view_area = ttk.Frame(self, style="TFrame")
@@ -633,6 +636,8 @@ class PicCullApp(tk.Tk):
 		self.canvas.pack_forget()
 		# Show gallery container
 		self._gallery_container.pack(fill=tk.BOTH, expand=True)
+		# Show the gallery-only thumbnail size panel
+		self.thumb_panel.pack(side=tk.LEFT)
 		self._rebuild_gallery()
 		self._set_status()
 		self._update_controls()
@@ -641,6 +646,8 @@ class PicCullApp(tk.Tk):
 		self.mode = "viewer"
 		# Hide gallery
 		self._gallery_container.pack_forget()
+		# Hide the gallery-only thumbnail size panel
+		self.thumb_panel.pack_forget()
 		# Show viewer canvas
 		self.canvas.pack(fill=tk.BOTH, expand=True)
 		self._show_current()
@@ -843,12 +850,27 @@ class PicCullApp(tk.Tk):
 		self.gallery_canvas.yview_moveto(max(0.0, min(1.0, y / max_y)))
 
 	# ----- Thumbnail size handling -----
-	def _on_thumb_size_change(self, value: float) -> None:
-		# Snap to nearest 16px to reduce churn
-		v = int(round(value / 16.0) * 16)
-		v = max(96, min(384, v))
+	def _snap_thumb(self, v: int) -> int:
+		# Snap around 96..384 using large steps
+		lo, hi, step = 96, 384, self.thumb_step
+		offset = max(0, v - lo)
+		snapped = lo + int(round(offset / step)) * step
+		return max(lo, min(hi, snapped))
+
+	def _on_thumb_scale_move(self, value: float) -> None:
+		# During drag, update label only (snapped), avoid rebuild
+		v = self._snap_thumb(int(value))
+		self.thumb_label.configure(text=f"Thumb {v}px")
+
+	def _apply_thumb_size_from_scale(self, _e=None) -> None:
+		v = self._snap_thumb(int(self.thumb_scale.get()))
+		# Snap the slider thumb to the discrete value
+		try:
+			self.thumb_scale.set(v)
+		except Exception:
+			pass
 		if v == self.thumb_size:
-			# Update label but avoid rebuild
+			# Nothing changed
 			self.thumb_label.configure(text=f"Thumb {v}px")
 			return
 		self.thumb_size = v

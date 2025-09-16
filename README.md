@@ -17,7 +17,7 @@ A tiny, minimalist image sifter for Windows built with Python and Tkinter. Pick 
   - Selection highlight matches the app’s style
   - Lazy-loading thumbnails in batches of 5 to keep scrolling smooth
   - Near-bottom and mouse-wheel scroll events trigger additional loads automatically
-  - Adjustable thumbnail size (96–384px) with a toolbar slider; grid reflows live
+  - Adjustable thumbnail size (96–384px) with a toolbar slider (visible in Gallery); grid reflows live
   - Session thumbnail cache for fast reuse while the app is open (cleared on exit)
 
 ## Requirements
