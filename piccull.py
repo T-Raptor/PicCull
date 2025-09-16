@@ -225,6 +225,8 @@ class PicCullApp(tk.Tk):
 		self.bind("<Down>", lambda e: self._move_selection_down())
 		# Undo: Ctrl+Z
 		self.bind("<Control-z>", lambda e: self.undo_last_delete())
+		# Global mouse wheel: scroll gallery anywhere; in viewer, wheel navigates
+		self.bind_all("<MouseWheel>", self._on_global_mouse_wheel, add=True)
 
 	# ----- Image / folder management -----
 	def choose_folder(self) -> None:
@@ -618,8 +620,7 @@ class PicCullApp(tk.Tk):
 		)
 		self.gallery_frame.bind("<Configure>", self._on_gallery_frame_configure)
 		self.gallery_canvas.bind("<Configure>", self._on_gallery_canvas_configure)
-		# Mouse wheel scroll (Windows)
-		self.gallery_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+		# Note: mouse wheel is handled globally in _on_global_mouse_wheel
 
 		# Initially hidden
 		self._gallery_container.pack_forget()
@@ -736,14 +737,47 @@ class PicCullApp(tk.Tk):
 		self._layout_gallery()
 		self._maybe_trigger_load_more()
 
-	def _on_mouse_wheel(self, event) -> None:
-		if self.mode != "gallery" or not self.gallery_canvas:
-			return
-		# event.delta is multiples of 120 on Windows; negative means scroll down
-		delta_units = int(-event.delta / 120)
-		if delta_units:
-			self.gallery_canvas.yview_scroll(delta_units, "units")
-			self._maybe_trigger_load_more()
+	def _on_global_mouse_wheel(self, event) -> str | None:
+		"""Global wheel handler.
+		- In Gallery: scroll the gallery canvas regardless of focus if pointer is within it.
+		- In Viewer: wheel navigates prev/next when pointer is over the viewer canvas.
+		Return "break" when handled to prevent duplicate scrolling; otherwise None.
+		"""
+		try:
+			w = event.widget
+		except Exception:
+			w = None
+		# Helper to check containment
+		def within(child: tk.Misc | None, parent: tk.Misc | None) -> bool:
+			while child is not None:
+				if child is parent:
+					return True
+				child = getattr(child, "master", None)
+			return False
+
+		# Ignore wheel when over scrollbars or sliders
+		wclass = getattr(w, "winfo_class", lambda: "")()
+		if wclass in ("TScrollbar", "Scrollbar", "TScale"):
+			return None
+
+		# Gallery scroll when pointer is over gallery canvas or its inner frame/children
+		if self.mode == "gallery" and self.gallery_canvas:
+			if within(w, self.gallery_canvas) or within(w, self.gallery_frame):
+				units = int(-event.delta / 120) or (1 if event.delta < 0 else -1)
+				self.gallery_canvas.yview_scroll(units, "units")
+				self._maybe_trigger_load_more()
+				return "break"
+
+		# Viewer: navigate prev/next when pointer is over viewer canvas
+		if self.mode == "viewer" and self.canvas:
+			if within(w, self.canvas):
+				if event.delta < 0:
+					self.next_image()
+				else:
+					self.prev_image()
+				return "break"
+
+		return None
 
 	def _ensure_loaded_upto(self, idx: int) -> None:
 		# Load more thumbnails up to include the index.
