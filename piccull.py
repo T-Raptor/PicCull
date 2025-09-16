@@ -90,7 +90,9 @@ class PicCullApp(tk.Tk):
 		self.mode: str = "viewer"
 		# Thumbnails
 		self.thumb_size: int = 200
-		self.thumb_cache: dict[Path, ImageTk.PhotoImage] = {}
+		self.thumb_size_var = tk.IntVar(value=self.thumb_size)
+		# Cache thumbnails for the session keyed by (path, size)
+		self.thumb_cache: dict[tuple[Path, int], ImageTk.PhotoImage] = {}
 		self._gallery_tiles: list[tk.Frame] = []
 		self._gallery_loaded_count: int = 0
 		self._gallery_loading: bool = False
@@ -164,6 +166,22 @@ class PicCullApp(tk.Tk):
 		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo, self.btn_mode):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
+		# Thumbnail size control (adjustable during session)
+		sep = ttk.Frame(top, style="Panel.TFrame")
+		sep.pack(side=tk.LEFT, padx=8)
+		self.thumb_label = ttk.Label(top, text=f"Thumb {self.thumb_size}px", style="Muted.TLabel")
+		self.thumb_label.pack(side=tk.LEFT, padx=(8, 4))
+		self.thumb_scale = ttk.Scale(
+			top,
+			from_=96,
+			to=384,
+			orient=tk.HORIZONTAL,
+			value=self.thumb_size,
+			length=160,
+			command=lambda v: self._on_thumb_size_change(float(v)),
+		)
+		self.thumb_scale.pack(side=tk.LEFT, padx=(0, 8))
+
 		# Center view container
 		self.view_area = ttk.Frame(self, style="TFrame")
 		self.view_area.pack(fill=tk.BOTH, expand=True)
@@ -189,6 +207,9 @@ class PicCullApp(tk.Tk):
 		self.status_label.pack(side=tk.LEFT, padx=8, pady=6)
 
 		self._update_controls()
+
+		# Ensure we clear ephemeral caches on close
+		self.protocol("WM_DELETE_WINDOW", self._on_close)
 
 	def _bind_keys(self) -> None:
 		self.bind("<Escape>", lambda e: self.destroy())
@@ -390,6 +411,8 @@ class PicCullApp(tk.Tk):
 			original_parent = cur.parent
 			original_name = cur.name
 			del self.images[self.index]
+			# Purge any thumbnails for this path from cache (all sizes)
+			self._purge_thumb_cache_for_path(cur)
 			# Prepare undo info
 			self._last_deleted = (original_parent, Path(moved_to), original_index, original_name)
 
@@ -665,23 +688,31 @@ class PicCullApp(tk.Tk):
 		lbl.bind("<Double-Button-1>", on_double)
 		return outer
 
-	def _get_thumbnail(self, path: Path) -> ImageTk.PhotoImage:
-		cached = self.thumb_cache.get(path)
+	def _get_thumbnail(self, path: Path, size: Optional[int] = None) -> ImageTk.PhotoImage:
+		s = int(size or self.thumb_size)
+		key = (path, s)
+		cached = self.thumb_cache.get(key)
 		if cached is not None:
 			return cached
 		try:
 			img = Image.open(path)
 			img = ImageOps.exif_transpose(img)
-			img.thumbnail((self.thumb_size, self.thumb_size), Image.Resampling.LANCZOS)
+			img.thumbnail((s, s), Image.Resampling.LANCZOS)
 			photo = ImageTk.PhotoImage(img)
-			self.thumb_cache[path] = photo
+			self.thumb_cache[key] = photo
 			return photo
 		except Exception:
 			# Fallback: empty placeholder
-			ph = Image.new("RGB", (self.thumb_size, self.thumb_size), color=(34, 34, 34))
+			ph = Image.new("RGB", (s, s), color=(34, 34, 34))
 			photo = ImageTk.PhotoImage(ph)
-			self.thumb_cache[path] = photo
+			self.thumb_cache[key] = photo
 			return photo
+
+	def _purge_thumb_cache_for_path(self, path: Path) -> None:
+		# Remove all sizes for a given path from cache
+		to_delete = [k for k in self.thumb_cache.keys() if k[0] == path]
+		for k in to_delete:
+			self.thumb_cache.pop(k, None)
 
 	def _on_gallery_frame_configure(self, _event=None) -> None:
 		if not self.gallery_canvas or not self.gallery_frame:
@@ -810,6 +841,30 @@ class PicCullApp(tk.Tk):
 			return
 		max_y = max(1, bbox[3])
 		self.gallery_canvas.yview_moveto(max(0.0, min(1.0, y / max_y)))
+
+	# ----- Thumbnail size handling -----
+	def _on_thumb_size_change(self, value: float) -> None:
+		# Snap to nearest 16px to reduce churn
+		v = int(round(value / 16.0) * 16)
+		v = max(96, min(384, v))
+		if v == self.thumb_size:
+			# Update label but avoid rebuild
+			self.thumb_label.configure(text=f"Thumb {v}px")
+			return
+		self.thumb_size = v
+		self.thumb_size_var.set(v)
+		self.thumb_label.configure(text=f"Thumb {v}px")
+		# Rebuild gallery lazily at new size; keep cache for other sizes for future reuse
+		if self.mode == "gallery":
+			self._rebuild_gallery()
+
+	def _on_close(self) -> None:
+		# Clear session caches (in-memory only) and exit
+		try:
+			self.thumb_cache.clear()
+		except Exception:
+			pass
+		self.destroy()
 
 	def _move_selection_up(self) -> None:
 		if self.mode != "gallery" or not self.images:
