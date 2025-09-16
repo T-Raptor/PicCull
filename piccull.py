@@ -86,6 +86,18 @@ class PicCullApp(tk.Tk):
 		self._left_arrow_id: Optional[int] = None
 		self._right_arrow_id: Optional[int] = None
 
+		# Modes: 'viewer' or 'gallery'
+		self.mode: str = "viewer"
+		# Thumbnails
+		self.thumb_size: int = 200
+		self.thumb_cache: dict[Path, ImageTk.PhotoImage] = {}
+		self._gallery_tiles: list[tk.Frame] = []
+		self._gallery_container: ttk.Frame  # initialized in _build_gallery_ui
+		self.gallery_canvas: tk.Canvas     # initialized in _build_gallery_ui
+		self.gallery_vscroll: ttk.Scrollbar
+		self.gallery_frame: ttk.Frame
+		self._gallery_window_id: Optional[int] = None
+
 		# UI
 		self._build_ui()
 		self._bind_keys()
@@ -144,18 +156,26 @@ class PicCullApp(tk.Tk):
 		self.btn_next = ttk.Button(top, text="Next", command=self.next_image)
 		self.btn_delete = ttk.Button(top, text="Delete", command=self.delete_current)
 		self.btn_undo = ttk.Button(top, text="Undo", command=self.undo_last_delete)
+		self.btn_mode = ttk.Button(top, text="Gallery", command=self.toggle_gallery)
 
-		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo):
+		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo, self.btn_mode):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
-		# Center canvas for image
+		# Center view container
+		self.view_area = ttk.Frame(self, style="TFrame")
+		self.view_area.pack(fill=tk.BOTH, expand=True)
+
+		# Viewer canvas
 		self.canvas = tk.Canvas(
-			self,
+			self.view_area,
 			bg=self.colors["bg"],
 			highlightthickness=0,
 		)
 		self.canvas.pack(fill=tk.BOTH, expand=True)
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+		# Gallery container (canvas + scrollbar), initially hidden
+		self._build_gallery_ui()
 
 		# Status bar (counter + text)
 		bottom = ttk.Frame(self, style="Panel.TFrame")
@@ -172,8 +192,10 @@ class PicCullApp(tk.Tk):
 		self.bind("<Left>", lambda e: self.prev_image())
 		self.bind("<Right>", lambda e: self.next_image())
 		self.bind("<Delete>", lambda e: self.delete_current())
-		self.bind("<Return>", lambda e: self.next_image())
-		self.bind("<space>", lambda e: self.next_image())
+		self.bind("<Return>", lambda e: self._on_enter_key())
+		self.bind("<space>", lambda e: self._on_enter_key())
+		self.bind("<Up>", lambda e: self._move_selection_up())
+		self.bind("<Down>", lambda e: self._move_selection_down())
 		# Undo: Ctrl+Z
 		self.bind("<Control-z>", lambda e: self.undo_last_delete())
 
@@ -191,6 +213,8 @@ class PicCullApp(tk.Tk):
 		self._set_status()
 		self._show_current()
 		self._update_controls()
+		# Rebuild gallery content if needed
+		self._rebuild_gallery()
 
 	def _set_status(self, extra: str = "") -> None:
 		if self.index == -1 or not self.images:
@@ -241,6 +265,18 @@ class PicCullApp(tk.Tk):
 
 		# Update canvas arrows
 		self._draw_arrows()
+		# Update mode button label
+		self.btn_mode.configure(text=("Viewer" if self.mode == "gallery" else "Gallery"))
+
+	def _on_enter_key(self) -> None:
+		if self.mode == "gallery":
+			# Open selected image in viewer
+			if self.images and 0 <= self.index < len(self.images):
+				self._leave_gallery()
+			else:
+				return
+		else:
+			self.next_image()
 
 	def _on_counter_click(self) -> None:
 		if not self.images:
@@ -256,6 +292,9 @@ class PicCullApp(tk.Tk):
 			self._set_status()
 			self._show_current()
 			self._update_controls()
+			if self.mode == "gallery":
+				self._update_selection_highlight()
+				self._ensure_selected_visible()
 
 	def _ask_image_number(self, total: int, current: int) -> Optional[int]:
 		"""Open a minimalist modal to ask for an image number (1..total)."""
@@ -317,7 +356,11 @@ class PicCullApp(tk.Tk):
 			return
 		self.index -= 1
 		self._set_status()
-		self._show_current()
+		if self.mode == "viewer":
+			self._show_current()
+		else:
+			self._update_selection_highlight()
+			self._ensure_selected_visible()
 		self._update_controls()
 
 	def next_image(self) -> None:
@@ -325,7 +368,11 @@ class PicCullApp(tk.Tk):
 			return
 		self.index += 1
 		self._set_status()
-		self._show_current()
+		if self.mode == "viewer":
+			self._show_current()
+		else:
+			self._update_selection_highlight()
+			self._ensure_selected_visible()
 		self._update_controls()
 
 	def delete_current(self) -> None:
@@ -356,7 +403,11 @@ class PicCullApp(tk.Tk):
 				except Exception:
 					rel_display = moved_to.name
 			self._set_status(extra=f"Moved to {rel_display}")
-			self._show_current()
+			if self.mode == "viewer":
+				self._show_current()
+			else:
+				# Rebuild gallery grid after delete
+				self._rebuild_gallery()
 			self._update_controls()
 		except Exception as e:
 			messagebox.showerror("Error", f"Failed to move file:\n{e}")
@@ -436,7 +487,7 @@ class PicCullApp(tk.Tk):
 			self._draw_arrows()
 
 	def _on_canvas_resize(self, _event) -> None:
-		if not self.current_image_pil:
+		if self.mode != "viewer" or not self.current_image_pil:
 			return
 		# Debounce rapid resize events
 		if self._resize_after_id:
@@ -447,7 +498,7 @@ class PicCullApp(tk.Tk):
 		self._resize_after_id = self.after(80, self._render_to_canvas)
 
 	def _render_to_canvas(self) -> None:
-		if not self.current_image_pil:
+		if self.mode != "viewer" or not self.current_image_pil:
 			return
 		canvas_w = max(1, self.canvas.winfo_width())
 		canvas_h = max(1, self.canvas.winfo_height())
@@ -480,6 +531,8 @@ class PicCullApp(tk.Tk):
 	def _draw_arrows(self) -> None:
 		# Remove existing arrows
 		self._clear_arrow_items()
+		if self.mode != "viewer":
+			return
 		has_images = bool(self.images)
 		if not has_images or self.index < 0:
 			return
@@ -513,6 +566,196 @@ class PicCullApp(tk.Tk):
 			self.canvas.tag_bind(self._right_arrow_id, "<Button-1>", lambda e: self.next_image())
 			self.canvas.tag_bind(self._right_arrow_id, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
 			self.canvas.tag_bind(self._right_arrow_id, "<Leave>", lambda e: self.canvas.config(cursor=""))
+
+	# ---------- Gallery UI ----------
+	def _build_gallery_ui(self) -> None:
+		self._gallery_container = ttk.Frame(self.view_area, style="TFrame")
+		# Canvas and vertical scrollbar
+		self.gallery_canvas = tk.Canvas(
+			self._gallery_container,
+			bg=self.colors["bg"],
+			highlightthickness=0,
+		)
+		self.gallery_vscroll = ttk.Scrollbar(
+			self._gallery_container, orient="vertical", command=self.gallery_canvas.yview
+		)
+		self.gallery_canvas.configure(yscrollcommand=self.gallery_vscroll.set)
+		self.gallery_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+		self.gallery_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+		self.gallery_frame = ttk.Frame(self.gallery_canvas, style="TFrame")
+		self._gallery_window_id = self.gallery_canvas.create_window(
+			(0, 0), window=self.gallery_frame, anchor="nw"
+		)
+		self.gallery_frame.bind("<Configure>", self._on_gallery_frame_configure)
+		self.gallery_canvas.bind("<Configure>", self._on_gallery_canvas_configure)
+
+		# Initially hidden
+		self._gallery_container.pack_forget()
+
+	def toggle_gallery(self) -> None:
+		if self.mode == "viewer":
+			self._enter_gallery()
+		else:
+			self._leave_gallery()
+
+	def _enter_gallery(self) -> None:
+		self.mode = "gallery"
+		# Hide viewer canvas
+		self.canvas.pack_forget()
+		# Show gallery container
+		self._gallery_container.pack(fill=tk.BOTH, expand=True)
+		self._rebuild_gallery()
+		self._set_status()
+		self._update_controls()
+
+	def _leave_gallery(self) -> None:
+		self.mode = "viewer"
+		# Hide gallery
+		self._gallery_container.pack_forget()
+		# Show viewer canvas
+		self.canvas.pack(fill=tk.BOTH, expand=True)
+		self._show_current()
+		self._set_status()
+		self._update_controls()
+
+	def _rebuild_gallery(self) -> None:
+		if not self.gallery_frame:
+			return
+		# Clear existing tiles
+		for child in list(self.gallery_frame.winfo_children()):
+			child.destroy()
+		self._gallery_tiles.clear()
+		# Build tiles
+		for idx, path in enumerate(self.images):
+			tile = self._create_tile(self.gallery_frame, idx, path)
+			self._gallery_tiles.append(tile)
+		# Layout according to current width
+		self._layout_gallery()
+		self._update_selection_highlight()
+		self._ensure_selected_visible()
+
+	def _create_tile(self, parent: tk.Misc, index: int, path: Path) -> tk.Frame:
+		# Outer frame as border
+		outer = tk.Frame(parent, bg=self.colors["border"])
+		inner = tk.Frame(outer, bg=self.colors["panel"])  # image background
+		inner.pack(padx=1, pady=1)
+		thumb = self._get_thumbnail(path)
+		lbl = tk.Label(inner, image=thumb, bg=self.colors["panel"]) 
+		lbl.pack()
+		# Mouse bindings
+		def on_click(_e=None, i=index):
+			self.index = i
+			self._update_selection_highlight()
+			self._set_status()
+			self._ensure_selected_visible()
+		def on_double(_e=None, i=index):
+			self.index = i
+			self._leave_gallery()
+		outer.bind("<Button-1>", on_click)
+		inner.bind("<Button-1>", on_click)
+		lbl.bind("<Button-1>", on_click)
+		outer.bind("<Double-Button-1>", on_double)
+		inner.bind("<Double-Button-1>", on_double)
+		lbl.bind("<Double-Button-1>", on_double)
+		return outer
+
+	def _get_thumbnail(self, path: Path) -> ImageTk.PhotoImage:
+		cached = self.thumb_cache.get(path)
+		if cached is not None:
+			return cached
+		try:
+			img = Image.open(path)
+			img = ImageOps.exif_transpose(img)
+			img.thumbnail((self.thumb_size, self.thumb_size), Image.Resampling.LANCZOS)
+			photo = ImageTk.PhotoImage(img)
+			self.thumb_cache[path] = photo
+			return photo
+		except Exception:
+			# Fallback: empty placeholder
+			ph = Image.new("RGB", (self.thumb_size, self.thumb_size), color=(34, 34, 34))
+			photo = ImageTk.PhotoImage(ph)
+			self.thumb_cache[path] = photo
+			return photo
+
+	def _on_gallery_frame_configure(self, _event=None) -> None:
+		if not self.gallery_canvas or not self.gallery_frame:
+			return
+		self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+
+	def _on_gallery_canvas_configure(self, _event=None) -> None:
+		# Ensure the inner frame matches canvas width and reflow layout
+		if not self.gallery_canvas or self._gallery_window_id is None:
+			return
+		cw = self.gallery_canvas.winfo_width()
+		self.gallery_canvas.itemconfigure(self._gallery_window_id, width=cw)
+		self._layout_gallery()
+
+	def _layout_gallery(self) -> None:
+		if not self.gallery_canvas or not self.gallery_frame:
+			return
+		cw = max(1, self.gallery_canvas.winfo_width())
+		gap = 16
+		tile_w = self.thumb_size + 2 + 2  # inner + border padding
+		cols = max(1, (cw - gap) // (tile_w + gap))
+		# Clear grid
+		for i, tile in enumerate(self._gallery_tiles):
+			row = i // cols
+			col = i % cols
+			tile.grid(row=row, column=col, padx=gap, pady=gap, sticky="n")
+		# Make columns expand equally
+		for c in range(cols):
+			self.gallery_frame.grid_columnconfigure(c, weight=1)
+
+	def _update_selection_highlight(self) -> None:
+		if not self._gallery_tiles:
+			return
+		for i, tile in enumerate(self._gallery_tiles):
+			bg = self.colors["fg"] if i == self.index else self.colors["border"]
+			tile.configure(bg=bg)
+
+	def _ensure_selected_visible(self) -> None:
+		if not self.gallery_canvas or not self._gallery_tiles or not (0 <= self.index < len(self._gallery_tiles)):
+			return
+		# Compute target row and approximate y position
+		cw = max(1, self.gallery_canvas.winfo_width())
+		gap = 16
+		tile_w = self.thumb_size + 2 + 2
+		cols = max(1, (cw - gap) // (tile_w + gap))
+		row = self.index // cols
+		row_height = self.thumb_size + gap + 4
+		y = row * row_height
+		bbox = self.gallery_canvas.bbox("all")
+		if bbox is None:
+			return
+		max_y = max(1, bbox[3])
+		self.gallery_canvas.yview_moveto(max(0.0, min(1.0, y / max_y)))
+
+	def _move_selection_up(self) -> None:
+		if self.mode != "gallery" or not self.images:
+			return
+		cw = max(1, self.gallery_canvas.winfo_width()) if self.gallery_canvas else 1
+		gap = 16
+		tile_w = self.thumb_size + 2 + 2
+		cols = max(1, (cw - gap) // (tile_w + gap))
+		self.index = max(0, self.index - cols)
+		self._set_status()
+		self._update_selection_highlight()
+		self._ensure_selected_visible()
+		self._update_controls()
+
+	def _move_selection_down(self) -> None:
+		if self.mode != "gallery" or not self.images:
+			return
+		cw = max(1, self.gallery_canvas.winfo_width()) if self.gallery_canvas else 1
+		gap = 16
+		tile_w = self.thumb_size + 2 + 2
+		cols = max(1, (cw - gap) // (tile_w + gap))
+		self.index = min(len(self.images) - 1, self.index + cols)
+		self._set_status()
+		self._update_selection_highlight()
+		self._ensure_selected_visible()
+		self._update_controls()
 
 
 def main() -> None:
