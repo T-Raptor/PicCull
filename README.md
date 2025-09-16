@@ -12,7 +12,9 @@ A tiny, minimalist image sifter for Windows (Python + Tkinter). Pick a folder, s
 ## Install & run
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m venv venv
+.\venv\Scripts\Activate
+pip install -r requirements.txt
 python piccull.py
 ```
 
@@ -33,4 +35,3 @@ Keys (quick): `Left/Right` navigate · `Enter/Space` next · `Delete` move to `.
 ## License
 
 MIT
-
