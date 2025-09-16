@@ -92,6 +92,9 @@ class PicCullApp(tk.Tk):
 		self.thumb_size: int = 200
 		self.thumb_cache: dict[Path, ImageTk.PhotoImage] = {}
 		self._gallery_tiles: list[tk.Frame] = []
+		self._gallery_loaded_count: int = 0
+		self._gallery_loading: bool = False
+		self._gallery_load_after: Optional[str] = None
 		self._gallery_container: ttk.Frame  # initialized in _build_gallery_ui
 		self.gallery_canvas: tk.Canvas     # initialized in _build_gallery_ui
 		self.gallery_vscroll: ttk.Scrollbar
@@ -589,6 +592,8 @@ class PicCullApp(tk.Tk):
 		)
 		self.gallery_frame.bind("<Configure>", self._on_gallery_frame_configure)
 		self.gallery_canvas.bind("<Configure>", self._on_gallery_canvas_configure)
+		# Mouse wheel scroll (Windows)
+		self.gallery_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
 
 		# Initially hidden
 		self._gallery_container.pack_forget()
@@ -627,11 +632,11 @@ class PicCullApp(tk.Tk):
 			child.destroy()
 		self._gallery_tiles.clear()
 		# Build tiles
-		for idx, path in enumerate(self.images):
-			tile = self._create_tile(self.gallery_frame, idx, path)
-			self._gallery_tiles.append(tile)
-		# Layout according to current width
+		# Create placeholders list matching images; actual tiles will be created lazily
+		self._gallery_tiles = [None] * len(self.images)  # type: ignore[list-item]
+		self._gallery_loaded_count = 0
 		self._layout_gallery()
+		self._load_next_batch()
 		self._update_selection_highlight()
 		self._ensure_selected_visible()
 
@@ -682,6 +687,7 @@ class PicCullApp(tk.Tk):
 		if not self.gallery_canvas or not self.gallery_frame:
 			return
 		self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+		self._maybe_trigger_load_more()
 
 	def _on_gallery_canvas_configure(self, _event=None) -> None:
 		# Ensure the inner frame matches canvas width and reflow layout
@@ -690,6 +696,21 @@ class PicCullApp(tk.Tk):
 		cw = self.gallery_canvas.winfo_width()
 		self.gallery_canvas.itemconfigure(self._gallery_window_id, width=cw)
 		self._layout_gallery()
+		self._maybe_trigger_load_more()
+
+	def _on_mouse_wheel(self, event) -> None:
+		if self.mode != "gallery" or not self.gallery_canvas:
+			return
+		# event.delta is multiples of 120 on Windows; negative means scroll down
+		delta_units = int(-event.delta / 120)
+		if delta_units:
+			self.gallery_canvas.yview_scroll(delta_units, "units")
+			self._maybe_trigger_load_more()
+
+	def _ensure_loaded_upto(self, idx: int) -> None:
+		# Load more thumbnails up to include the index.
+		while idx >= self._gallery_loaded_count and self._gallery_loaded_count < len(self._gallery_tiles):
+			self._load_next_batch()
 
 	def _layout_gallery(self) -> None:
 		if not self.gallery_canvas or not self.gallery_frame:
@@ -698,8 +719,10 @@ class PicCullApp(tk.Tk):
 		gap = 16
 		tile_w = self.thumb_size + 2 + 2  # inner + border padding
 		cols = max(1, (cw - gap) // (tile_w + gap))
-		# Clear grid
+		# Place any already-created tiles; placeholders will be skipped
 		for i, tile in enumerate(self._gallery_tiles):
+			if tile is None:
+				continue
 			row = i // cols
 			col = i % cols
 			tile.grid(row=row, column=col, padx=gap, pady=gap, sticky="n")
@@ -711,12 +734,69 @@ class PicCullApp(tk.Tk):
 		if not self._gallery_tiles:
 			return
 		for i, tile in enumerate(self._gallery_tiles):
+			if tile is None:
+				continue
 			bg = self.colors["fg"] if i == self.index else self.colors["border"]
 			tile.configure(bg=bg)
 
 	def _ensure_selected_visible(self) -> None:
 		if not self.gallery_canvas or not self._gallery_tiles or not (0 <= self.index < len(self._gallery_tiles)):
 			return
+		# Ensure tile exists around selection
+		self._ensure_loaded_upto(self.index)
+		# Compute target row and approximate y position and scroll to it
+		cw = max(1, self.gallery_canvas.winfo_width())
+		gap = 16
+		tile_w = self.thumb_size + 2 + 2
+		cols = max(1, (cw - gap) // (tile_w + gap))
+		row = self.index // cols
+		row_height = self.thumb_size + gap + 4
+		y = row * row_height
+		bbox = self.gallery_canvas.bbox("all")
+		if bbox:
+			max_y = max(1, bbox[3])
+			self.gallery_canvas.yview_moveto(max(0.0, min(1.0, y / max_y)))
+
+		# Trigger more loading if near bottom
+		self._maybe_trigger_load_more()
+
+	def _maybe_trigger_load_more(self) -> None:
+		if not self.gallery_canvas or not self._gallery_tiles:
+			return
+		bbox = self.gallery_canvas.bbox("all")
+		if not bbox:
+			return
+		_, y0, _, y1 = bbox
+		view_y0 = self.gallery_canvas.canvasy(0)
+		view_y1 = view_y0 + self.gallery_canvas.winfo_height()
+		# If within 1.5 screens of bottom, load more
+		if view_y1 + (self.gallery_canvas.winfo_height() * 0.5) >= y1:
+			self._load_next_batch()
+
+	def _load_next_batch(self) -> None:
+		if self._gallery_loading:
+			return
+		if self._gallery_loaded_count >= len(self._gallery_tiles):
+			return
+		self._gallery_loading = True
+		batch_size = 5
+		start = self._gallery_loaded_count
+		end = min(len(self._gallery_tiles), start + batch_size)
+		for i in range(start, end):
+			path = self.images[i]
+			tile = self._create_tile(self.gallery_frame, i, path)
+			self._gallery_tiles[i] = tile
+		self._gallery_loaded_count = end
+		self._layout_gallery()
+		self._update_selection_highlight()
+		self._gallery_loading = False
+		# If still near bottom, schedule another batch with slight delay to stay responsive
+		if self._gallery_load_after:
+			try:
+				self.after_cancel(self._gallery_load_after)
+			except Exception:
+				pass
+		self._gallery_load_after = self.after(50, self._maybe_trigger_load_more)
 		# Compute target row and approximate y position
 		cw = max(1, self.gallery_canvas.winfo_width())
 		gap = 16
