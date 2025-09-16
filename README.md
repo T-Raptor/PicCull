@@ -29,7 +29,7 @@ Keys (quick):
 
 - <kbd>←</kbd>/<kbd>→</kbd> - Navigate
 - <kbd>Enter</kbd>/<kbd>Space</kbd> - Next
-- <kbd>Delete</kbd> - Move to `.deleted`
+- <kbd>Del</kbd> - Move to `.deleted`
 - <kbd>Ctrl</kbd>+<kbd>Z</kbd> - Undo
 - <kbd>Esc</kbd> - Leave Gallery/Close dialogs
 
