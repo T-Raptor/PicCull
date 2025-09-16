@@ -5,8 +5,8 @@ A tiny, minimalist image sifter for Windows (Python + Tkinter). Pick a folder, s
 ## What it does
 
 - Open a folder of images and review them quickly
-- Delete moves files to a sibling `.deleted` folder (non-destructive); undo with Ctrl+Z
-- Viewer: Left/Right to navigate, Enter/Space for next, clickable on-canvas arrows
+- Delete moves files to a sibling `.deleted` folder (non-destructive); undo with <kbd>Ctrl</kbd>+<kbd>Z</kbd>
+- Viewer: <kbd>←</kbd>/<kbd>→</kbd> to navigate, <kbd>Enter</kbd>/<kbd>Space</kbd> for next, clickable on-canvas arrows
 - Gallery: scrollable thumbnails, double-click to open, lazy-loaded, adjustable size
 
 ## Install & run
@@ -25,7 +25,13 @@ python piccull.py
 3. Click the counter (e.g., `12/240`) to jump to an image
 4. Toggle Gallery to browse thumbnails; scroll to load more
 
-Keys (quick): `Left/Right` navigate · `Enter/Space` next · `Delete` move to `.deleted` · `Ctrl+Z` undo · `Esc` leave Gallery/close dialogs
+Keys (quick):
+
+- <kbd>←</kbd>/<kbd>→</kbd> - Navigate
+- <kbd>Enter</kbd>/<kbd>Space</kbd> - Next
+- <kbd>Delete</kbd> - Move to `.deleted`
+- <kbd>Ctrl</kbd>+<kbd>Z</kbd> - Undo
+- <kbd>Esc</kbd> - Leave Gallery/Close dialogs
 
 ## Notes
 
