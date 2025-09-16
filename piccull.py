@@ -80,6 +80,11 @@ class PicCullApp(tk.Tk):
 		self.current_image_pil: Optional[Image.Image] = None
 		self.current_photo: Optional[ImageTk.PhotoImage] = None
 		self._resize_after_id: Optional[str] = None
+		# Undo: (original_parent, moved_to_path, original_index, original_name)
+		self._last_deleted: Optional[Tuple[Path, Path, int, str]] = None
+		# Canvas arrow items
+		self._left_arrow_id: Optional[int] = None
+		self._right_arrow_id: Optional[int] = None
 
 		# UI
 		self._build_ui()
@@ -138,8 +143,9 @@ class PicCullApp(tk.Tk):
 		self.btn_prev = ttk.Button(top, text="Prev", command=self.prev_image)
 		self.btn_next = ttk.Button(top, text="Next", command=self.next_image)
 		self.btn_delete = ttk.Button(top, text="Delete", command=self.delete_current)
+		self.btn_undo = ttk.Button(top, text="Undo", command=self.undo_last_delete)
 
-		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete):
+		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
 		# Center canvas for image
@@ -166,6 +172,8 @@ class PicCullApp(tk.Tk):
 		self.bind("<Delete>", lambda e: self.delete_current())
 		self.bind("<Return>", lambda e: self.next_image())
 		self.bind("<space>", lambda e: self.next_image())
+		# Undo: Ctrl+Z
+		self.bind("<Control-z>", lambda e: self.undo_last_delete())
 
 	# ----- Image / folder management -----
 	def choose_folder(self) -> None:
@@ -177,6 +185,7 @@ class PicCullApp(tk.Tk):
 		self.folder = folder
 		self.images = imgs
 		self.index = 0 if imgs else -1
+		self._last_deleted = None
 		self._set_status()
 		self._show_current()
 		self._update_controls()
@@ -193,24 +202,33 @@ class PicCullApp(tk.Tk):
 
 	def _update_controls(self) -> None:
 		has_images = bool(self.images)
-		state_normal = tk.NORMAL if has_images else tk.DISABLED
-		self.btn_prev.configure(state=state_normal)
-		self.btn_next.configure(state=state_normal)
-		self.btn_delete.configure(state=state_normal)
+		at_first = has_images and self.index <= 0
+		at_last = has_images and self.index >= (len(self.images) - 1)
+
+		# Prev/Next enabled based on edges (no wrap)
+		self.btn_prev.configure(state=(tk.NORMAL if (has_images and not at_first) else tk.DISABLED))
+		self.btn_next.configure(state=(tk.NORMAL if (has_images and not at_last) else tk.DISABLED))
+		self.btn_delete.configure(state=(tk.NORMAL if has_images else tk.DISABLED))
+		self.btn_undo.configure(state=(tk.NORMAL if self._last_deleted else tk.DISABLED))
+
+		# Update canvas arrows
+		self._draw_arrows()
 
 	def prev_image(self) -> None:
-		if not self.images:
+		if not self.images or self.index <= 0:
 			return
-		self.index = (self.index - 1) % len(self.images)
+		self.index -= 1
 		self._set_status()
 		self._show_current()
+		self._update_controls()
 
 	def next_image(self) -> None:
-		if not self.images:
+		if not self.images or self.index >= (len(self.images) - 1):
 			return
-		self.index = (self.index + 1) % len(self.images)
+		self.index += 1
 		self._set_status()
 		self._show_current()
+		self._update_controls()
 
 	def delete_current(self) -> None:
 		if not self.images:
@@ -220,8 +238,15 @@ class PicCullApp(tk.Tk):
 			target_dir = ensure_deleted_folder(cur.parent)
 			moved_to = safe_move_to_deleted(cur, target_dir)
 			# Remove from list and adjust index
+			original_index = self.index
+			original_parent = cur.parent
+			original_name = cur.name
 			del self.images[self.index]
+			# Prepare undo info
+			self._last_deleted = (original_parent, Path(moved_to), original_index, original_name)
+
 			if self.images:
+				# Clamp to last element if we deleted last
 				self.index = min(self.index, len(self.images) - 1)
 			else:
 				self.index = -1
@@ -237,6 +262,41 @@ class PicCullApp(tk.Tk):
 			self._update_controls()
 		except Exception as e:
 			messagebox.showerror("Error", f"Failed to move file:\n{e}")
+
+	def undo_last_delete(self) -> None:
+		if not self._last_deleted:
+			return
+		original_parent, moved_to, original_index, original_name = self._last_deleted
+		try:
+			# Compute restore destination with collision-safe naming
+			dest = original_parent / original_name
+			if dest.exists():
+				stem, ext = Path(original_name).stem, Path(original_name).suffix
+				i = 1
+				while True:
+					candidate = original_parent / f"{stem}-restored-{i}{ext}"
+					if not candidate.exists():
+						dest = candidate
+						break
+					i += 1
+			shutil.move(str(moved_to), str(dest))
+			# Insert back into list near original index (clamped)
+			insert_at = max(0, min(original_index, len(self.images)))
+			self.images.insert(insert_at, dest)
+			self.index = insert_at
+			self._last_deleted = None
+			# Update UI
+			rel_display = dest.name
+			if self.folder is not None:
+				try:
+					rel_display = str(dest.relative_to(self.folder))
+				except Exception:
+					rel_display = dest.name
+			self._set_status(extra=f"Restored {rel_display}")
+			self._show_current()
+			self._update_controls()
+		except Exception as e:
+			messagebox.showerror("Error", f"Failed to restore file:\n{e}")
 
 	# ----- Rendering -----
 	def _show_current(self) -> None:
@@ -255,6 +315,8 @@ class PicCullApp(tk.Tk):
 				fill=self.colors["muted"],
 				font=self.base_font,
 			)
+			# No image; also clear arrows
+			self._draw_arrows()
 			return
 
 		path = self.images[self.index]
@@ -273,6 +335,7 @@ class PicCullApp(tk.Tk):
 				anchor="nw",
 				font=self.small_font,
 			)
+			self._draw_arrows()
 
 	def _on_canvas_resize(self, _event) -> None:
 		if not self.current_image_pil:
@@ -300,6 +363,58 @@ class PicCullApp(tk.Tk):
 
 		self.canvas.delete("all")
 		self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo, anchor="center")
+		self._draw_arrows()
+
+	def _clear_arrow_items(self) -> None:
+		if self._left_arrow_id is not None:
+			try:
+				self.canvas.delete(self._left_arrow_id)
+			except Exception:
+				pass
+			self._left_arrow_id = None
+		if self._right_arrow_id is not None:
+			try:
+				self.canvas.delete(self._right_arrow_id)
+			except Exception:
+				pass
+			self._right_arrow_id = None
+
+	def _draw_arrows(self) -> None:
+		# Remove existing arrows
+		self._clear_arrow_items()
+		has_images = bool(self.images)
+		if not has_images or self.index < 0:
+			return
+		at_first = self.index <= 0
+		at_last = self.index >= (len(self.images) - 1)
+
+		cw = self.canvas.winfo_width() or 800
+		ch = self.canvas.winfo_height() or 600
+		y = ch // 2
+		# Responsive arrow size
+		size = max(18, min(72, int(ch * 0.08)))
+		arrow_font = (self.font_family, size)
+		padding = max(16, int(cw * 0.02))
+		x_left = padding
+		x_right = cw - padding
+
+		# Left arrow (hidden on first)
+		if not at_first:
+			self._left_arrow_id = self.canvas.create_text(
+				x_left, y, text="‹", fill=self.colors["fg"], font=arrow_font, anchor="w"
+			)
+			self.canvas.tag_bind(self._left_arrow_id, "<Button-1>", lambda e: self.prev_image())
+			self.canvas.tag_bind(self._left_arrow_id, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+			self.canvas.tag_bind(self._left_arrow_id, "<Leave>", lambda e: self.canvas.config(cursor=""))
+
+		# Right arrow (hidden on last)
+		if not at_last:
+			self._right_arrow_id = self.canvas.create_text(
+				x_right, y, text="›", fill=self.colors["fg"], font=arrow_font, anchor="e"
+			)
+			self.canvas.tag_bind(self._right_arrow_id, "<Button-1>", lambda e: self.next_image())
+			self.canvas.tag_bind(self._right_arrow_id, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+			self.canvas.tag_bind(self._right_arrow_id, "<Leave>", lambda e: self.canvas.config(cursor=""))
 
 
 def main() -> None:
