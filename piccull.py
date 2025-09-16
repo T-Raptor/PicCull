@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 try:
 	from PIL import Image, ImageTk, ImageOps
@@ -243,101 +243,74 @@ class PicCullApp(tk.Tk):
 		self._draw_arrows()
 
 	def _on_counter_click(self) -> None:
-		self._open_jump_overlay()
-
-	def _open_jump_overlay(self) -> None:
 		if not self.images:
 			return
-		# Ensure geometry info is up to date
-		self.update_idletasks()
 		n = len(self.images)
 		current = self.index + 1 if self.index >= 0 else 1
+		val = self._ask_image_number(n, current)
+		if val is None:
+			return
+		target = int(val) - 1
+		if 0 <= target < n and target != self.index:
+			self.index = target
+			self._set_status()
+			self._show_current()
+			self._update_controls()
 
-		# Create a full-window overlay
-		rx, ry = self.winfo_rootx(), self.winfo_rooty()
-		rw, rh = self.winfo_width(), self.winfo_height()
-		ov = tk.Toplevel(self)
-		ov.overrideredirect(True)
-		ov.transient(self)
-		ov.attributes("-topmost", True)
-		try:
-			ov.attributes("-alpha", 0.88)
-		except Exception:
-			pass
-		ov.configure(bg="#000000")
-		ov.geometry(f"{rw}x{rh}+{rx}+{ry}")
-		ov.grab_set()
+	def _ask_image_number(self, total: int, current: int) -> Optional[int]:
+		"""Open a minimalist modal to ask for an image number (1..total)."""
+		top = tk.Toplevel(self)
+		top.title("Go to image")
+		top.configure(bg=self.colors["panel"])  # background to match app
+		top.transient(self)
+		top.resizable(False, False)
+		top.grab_set()
 
-		# Close helpers
-		def _close():
-			try:
-				ov.grab_release()
-			except Exception:
-				pass
-			ov.destroy()
+		frm = ttk.Frame(top, style="Panel.TFrame", padding=12)
+		frm.pack(fill=tk.BOTH, expand=True)
 
-		def _confirm():
-			s = entry_var.get().strip()
+		lbl = ttk.Label(frm, text=f"Enter image number (1-{total}):", style="TLabel")
+		lbl.pack(anchor="w", pady=(0, 6))
+
+		var = tk.StringVar(value=str(current))
+		entry = ttk.Entry(frm, font=self.base_font, textvariable=var)
+		entry.pack(fill=tk.X)
+		entry.select_range(0, tk.END)
+		entry.focus_set()
+
+		btns = ttk.Frame(frm, style="Panel.TFrame")
+		btns.pack(fill=tk.X, pady=(10, 0))
+		cancel_btn = ttk.Button(btns, text="Cancel", command=top.destroy)
+		ok_btn = ttk.Button(btns, text="OK")
+		cancel_btn.pack(side=tk.RIGHT)
+		ok_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
+		result: dict[str, Optional[int]] = {"value": None}
+
+		def on_ok(_e=None) -> None:
+			s = var.get().strip()
 			if not s.isdigit():
-				msg.configure(text="Please enter a number.")
+				entry.bell()
 				return
 			v = int(s)
-			if v < 1 or v > n:
-				msg.configure(text=f"Number must be 1 to {n}.")
+			if v < 1 or v > total:
+				entry.bell()
 				return
-			target = v - 1
-			if target != self.index:
-				self.index = target
-				self._set_status()
-				self._show_current()
-				self._update_controls()
-			_close()
+			result["value"] = v
+			top.destroy()
 
-		# Inner centered dialog panel
-		panel = tk.Frame(ov, bg=self.colors["panel"], highlightthickness=1, highlightbackground=self.colors["border"])
-		panel_w = max(280, min(420, int(rw * 0.35)))
-		panel_h = 150
-		panel.place(relx=0.5, rely=0.5, anchor="center", width=panel_w, height=panel_h)
+		ok_btn.configure(command=on_ok)
+		top.bind("<Return>", on_ok)
+		top.bind("<Escape>", lambda e: top.destroy())
 
-		title = tk.Label(
-			panel,
-			text=f"Go to image (1-{n})",
-			bg=self.colors["panel"],
-			fg=self.colors["fg"],
-			font=self.base_font,
-		)
-		title.pack(pady=(16, 8))
+		# Center the dialog over the app window
+		top.update_idletasks()
+		x = self.winfo_rootx() + (self.winfo_width() // 2 - top.winfo_width() // 2)
+		y = self.winfo_rooty() + (self.winfo_height() // 2 - top.winfo_height() // 2)
+		top.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-		entry_var = tk.StringVar(value=str(current))
-		entry = tk.Entry(
-			panel,
-			textvariable=entry_var,
-			bg=self.colors["bg"],
-			fg=self.colors["fg"],
-			insertbackground=self.colors["fg"],
-			font=self.base_font,
-			justify="center",
-			relief="flat",
-			highlightthickness=1,
-			highlightbackground=self.colors["border"],
-		)
-		entry.pack(padx=20, fill="x")
-		entry.configure(insertwidth=2)
-
-		msg = tk.Label(
-			panel,
-			text="Press Enter to jump • Esc to cancel",
-			bg=self.colors["panel"],
-			fg=self.colors["muted"],
-			font=self.small_font,
-		)
-		msg.pack(pady=(10, 8))
-
-		# Bindings
-		ov.bind("<Escape>", lambda e: _close())
-		ov.bind("<Button-1>", lambda e: _close() if e.widget is ov else None)
-		entry.bind("<Return>", lambda e: _confirm())
-		entry.focus_set()
+		top.wait_window()
+		return result["value"]
 
 	def prev_image(self) -> None:
 		if not self.images or self.index <= 0:
