@@ -169,13 +169,13 @@ class PicCullApp(tk.Tk):
 		top = ttk.Frame(self, style="Panel.TFrame")
 		top.pack(side=tk.TOP, fill=tk.X)
 
-		self.btn_open = ttk.Button(top, text="Open", command=self.choose_folder)
-		self.btn_prev = ttk.Button(top, text="Prev", command=self.prev_image)
-		self.btn_next = ttk.Button(top, text="Next", command=self.next_image)
-		self.btn_mark = ttk.Button(top, text="Mark", command=self.toggle_mark)
-		self.btn_unmark_all = ttk.Button(top, text="Unmark All", command=self.unmark_all)
-		self.btn_apply = ttk.Button(top, text="Apply (0)", command=self.apply_marks)
-		self.btn_mode = ttk.Button(top, text="Gallery", command=self.toggle_gallery)
+		self.btn_open = ttk.Button(top, text="Open", command=self.choose_folder, takefocus=False)
+		self.btn_prev = ttk.Button(top, text="Prev", command=self.prev_image, takefocus=False)
+		self.btn_next = ttk.Button(top, text="Next", command=self.next_image, takefocus=False)
+		self.btn_mark = ttk.Button(top, text="Mark", command=self.toggle_mark, takefocus=False)
+		self.btn_unmark_all = ttk.Button(top, text="Unmark All", command=self.unmark_all, takefocus=False)
+		self.btn_apply = ttk.Button(top, text="Apply (0)", command=self.apply_marks, takefocus=False)
+		self.btn_mode = ttk.Button(top, text="Gallery", command=self.toggle_gallery, takefocus=False)
 
 		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_mark,
 				  self.btn_unmark_all, self.btn_apply, self.btn_mode):
@@ -193,6 +193,7 @@ class PicCullApp(tk.Tk):
 			value=self.thumb_size,
 			length=160,
 			command=lambda v: self._on_thumb_scale_move(float(v)),
+			takefocus=False,
 		)
 		self.thumb_scale.pack(side=tk.LEFT, padx=(0, 8), pady=8)
 		# Apply on mouse/key release only
@@ -286,11 +287,17 @@ class PicCullApp(tk.Tk):
 		return "TkFixedFont"
 
 	def _bind_keys(self) -> None:
+		# Prevent focused buttons from consuming space
+		try:
+			self.unbind_class("TButton", "<Key-space>")
+		except Exception:
+			pass
+
 		self.bind("<Escape>", lambda e: self.destroy())
 		self.bind("<Left>", lambda e: self.prev_image())
 		self.bind("<Right>", lambda e: self.next_image())
 		self.bind("<Delete>", lambda e: self.toggle_mark())
-		self.bind("<space>", lambda e: self.toggle_mark())
+		self.bind("<space>", lambda e: (self.toggle_mark(), "break")[1])
 		self.bind("<Return>", lambda e: self._on_enter_key())
 		self.bind("<Up>", lambda e: self._move_selection_up())
 		self.bind("<Down>", lambda e: self._move_selection_down())
@@ -348,6 +355,7 @@ class PicCullApp(tk.Tk):
 
 	def choose_folder(self) -> None:
 		path = filedialog.askdirectory(title="Select image folder")
+		self.focus_set()
 		if not path:
 			return
 		folder = Path(path)
