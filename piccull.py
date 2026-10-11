@@ -1,5 +1,7 @@
+import io
 import json
 import os
+import subprocess
 import sys
 import shutil
 from pathlib import Path
@@ -10,20 +12,38 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import tkinter.font as tkfont
 
 try:
-	from PIL import Image, ImageTk, ImageOps
+	from PIL import Image, ImageTk, ImageOps, ImageDraw
 except ImportError:
 	# Pillow not installed; provide a helpful message
 	raise SystemExit(
 		"Pillow is required. Install with: python -m pip install -r requirements.txt"
 	)
 
+# Register HEIC/HEIF opener if pillow-heif installed
+try:
+	import pillow_heif
+	pillow_heif.register_heif_opener()
+except ImportError:
+	pass
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+
+IMG_EXTS = {
+	".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+	".heic", ".heif", ".hif",
+}
+VID_EXTS = {
+	".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".flv",
+}
+MEDIA_EXTS = IMG_EXTS | VID_EXTS
 SESSION_FILENAME = ".piccull_session.json"
 
 
+def is_video(path: Path) -> bool:
+	return path.suffix.lower() in VID_EXTS
+
+
 def is_image(path: Path) -> bool:
-	return path.suffix.lower() in IMG_EXTS and not path.name.startswith(".")
+	return path.suffix.lower() in MEDIA_EXTS and not path.name.startswith(".")
 
 
 def list_images(folder: Path) -> List[Path]:
@@ -31,6 +51,48 @@ def list_images(folder: Path) -> List[Path]:
 		[p for p in folder.iterdir() if p.is_file() and is_image(p)],
 		key=lambda p: p.name.lower(),
 	)
+
+
+def extract_video_frame(path: Path) -> Image.Image:
+	"""Extract video poster frame via ffmpeg or generate fallback placeholder."""
+	creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+	for args in (["-ss", "0.1", "-i", str(path)], ["-i", str(path)]):
+		try:
+			cmd = ["ffmpeg", *args, "-vframes", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
+			proc = subprocess.run(
+				cmd,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.DEVNULL,
+				creationflags=creationflags,
+				timeout=6,
+			)
+			if proc.stdout:
+				img = Image.open(io.BytesIO(proc.stdout))
+				return ImageOps.exif_transpose(img)
+		except Exception:
+			pass
+
+	# Fallback placeholder when ffmpeg cannot extract
+	ph = Image.new("RGB", (640, 360), color=(26, 26, 26))
+	draw = ImageDraw.Draw(ph)
+	draw.polygon([(300, 155), (300, 205), (345, 180)], fill=(200, 200, 200))
+	return ph
+
+
+def load_media_image(path: Path) -> Image.Image:
+	"""Load image or extract video/HEIC poster frame."""
+	if is_video(path):
+		return extract_video_frame(path)
+	try:
+		img = Image.open(path)
+		return ImageOps.exif_transpose(img)
+	except Exception:
+		# Fall back to ffmpeg if Pillow cannot decode (e.g. HEIC without pillow-heif)
+		if path.suffix.lower() in {".heic", ".heif", ".hif"}:
+			img = extract_video_frame(path)
+			if img:
+				return img
+		raise
 
 
 def ensure_deleted_folder(base: Path) -> Path:
@@ -212,6 +274,7 @@ class PicCullApp(tk.Tk):
 		)
 		self.canvas.pack(fill=tk.BOTH, expand=True)
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
+		self.canvas.bind("<Double-Button-1>", lambda e: self.play_current_video())
 
 		# Gallery container (canvas + scrollbar), initially hidden
 		self._build_gallery_ui()
@@ -305,6 +368,9 @@ class PicCullApp(tk.Tk):
 		self.bind("<Control-z>", lambda e: self._undo_last_mark())
 		# Ctrl+Return: open apply dialog
 		self.bind("<Control-Return>", lambda e: self.apply_marks())
+		# P: play current video
+		self.bind("<p>", lambda e: self.play_current_video())
+		self.bind("<P>", lambda e: self.play_current_video())
 		# Global mouse wheel: scroll gallery anywhere; in viewer, wheel navigates
 		self.bind_all("<MouseWheel>", self._on_global_mouse_wheel, add=True)
 
@@ -401,8 +467,10 @@ class PicCullApp(tk.Tk):
 		else:
 			im_path = self.images[self.index]
 			is_marked = im_path.name in self.marked
+			is_vid = is_video(im_path)
+			vid_tag = "[VIDEO] " if is_vid else ""
 			counter = f"{self.index + 1}/{len(self.images)}"
-			info = f" — {im_path.name}"
+			info = f" — {vid_tag}{im_path.name}"
 			if is_marked:
 				info = f"{info}  ●"
 			if extra:
@@ -800,9 +868,7 @@ class PicCullApp(tk.Tk):
 
 		path = self.images[self.index]
 		try:
-			img = Image.open(path)
-			# Correct orientation from EXIF if present
-			img = ImageOps.exif_transpose(img)
+			img = load_media_image(path)
 			self.current_image_pil = img
 			self._render_to_canvas()
 		except Exception as e:
@@ -844,6 +910,7 @@ class PicCullApp(tk.Tk):
 		self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo, anchor="center")
 		self._draw_arrows()
 		self._draw_mark_badge()
+		self._draw_video_badge()
 
 	def _draw_mark_badge(self) -> None:
 		"""Draw a small amber dot in the top-right corner when current image is marked."""
@@ -863,6 +930,40 @@ class PicCullApp(tk.Tk):
 			outline="",
 			tags="mark_badge",
 		)
+
+	def _draw_video_badge(self) -> None:
+		"""Draw video indicator in viewer canvas if current media is a video."""
+		self.canvas.delete("video_badge")
+		if not self.images or self.index < 0:
+			return
+		if not is_video(self.images[self.index]):
+			return
+		ch = self.canvas.winfo_height() or 600
+		self.canvas.create_text(
+			20,
+			ch - 24,
+			text="▶ VIDEO  (Double-click or press P to play)",
+			fill=self.colors["fg"],
+			font=self.small_font,
+			anchor="w",
+			tags="video_badge",
+		)
+
+	def play_current_video(self) -> None:
+		"""Open current video in system default player."""
+		if not self.images or self.index < 0:
+			return
+		cur = self.images[self.index]
+		if is_video(cur) and cur.exists():
+			try:
+				if sys.platform.startswith("win"):
+					os.startfile(str(cur))
+				elif sys.platform == "darwin":
+					subprocess.Popen(["open", str(cur)])
+				else:
+					subprocess.Popen(["xdg-open", str(cur)])
+			except Exception as e:
+				messagebox.showerror("Error playing video", str(e))
 
 	def _clear_arrow_items(self) -> None:
 		if self._left_arrow_id is not None:
@@ -1042,15 +1143,25 @@ class PicCullApp(tk.Tk):
 		if cached is not None:
 			return cached
 		try:
-			img = Image.open(path)
-			img = ImageOps.exif_transpose(img)
+			img = load_media_image(path)
 			img.thumbnail((s, s), Image.Resampling.LANCZOS)
+			if is_video(path):
+				# Overlay small play indicator badge on video thumbnail
+				draw = ImageDraw.Draw(img)
+				tw, th = img.size
+				bw, bh = 22, 16
+				bx, by = max(0, tw - bw - 4), max(0, th - bh - 4)
+				draw.rectangle([bx, by, bx + bw, by + bh], fill=(0, 0, 0))
+				draw.polygon([(bx + 7, by + 4), (bx + 7, by + 12), (bx + 16, by + 8)], fill=(255, 255, 255))
 			photo = ImageTk.PhotoImage(img)
 			self.thumb_cache[key] = photo
 			return photo
 		except Exception:
 			# Fallback: empty placeholder
 			ph = Image.new("RGB", (s, s), color=(34, 34, 34))
+			if is_video(path):
+				draw = ImageDraw.Draw(ph)
+				draw.polygon([(s // 2 - 6, s // 2 - 10), (s // 2 - 6, s // 2 + 10), (s // 2 + 10, s // 2)], fill=(160, 160, 160))
 			photo = ImageTk.PhotoImage(ph)
 			self.thumb_cache[key] = photo
 			return photo
