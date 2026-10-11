@@ -41,17 +41,15 @@ htmlcov/
 .vscode/
 .idea/
 *.code-workspace
-__pycache__/
-*.py[cod]
-*.log
-.env
-.venv/
-venv/
-.idea/
-.vscode/
 .ropeproject/
+
+# OS
 Thumbs.db
 Desktop.ini
+
+# Misc
+*.log
+.env
 
 # Agent
 .agents/
