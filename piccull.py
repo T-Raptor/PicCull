@@ -35,8 +35,36 @@ IMG_EXTS = {
 VID_EXTS = {
 	".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".flv",
 }
-MEDIA_EXTS = IMG_EXTS | VID_EXTS
 SESSION_FILENAME = ".piccull_session.json"
+
+
+def load_app_config() -> dict:
+	cfg_path = Path.home() / ".piccull_config.json"
+	if cfg_path.exists():
+		try:
+			return json.loads(cfg_path.read_text(encoding="utf-8"))
+		except Exception:
+			pass
+	return {}
+
+
+def save_app_config(cfg: dict) -> None:
+	cfg_path = Path.home() / ".piccull_config.json"
+	try:
+		cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+	except Exception:
+		pass
+
+
+def find_default_media_player() -> Optional[str]:
+	candidates = [
+		r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+		r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+	]
+	for c in candidates:
+		if Path(c).is_file():
+			return c
+	return shutil.which("vlc") or shutil.which("mpv")
 
 
 def is_video(path: Path) -> bool:
@@ -173,6 +201,10 @@ class PicCullApp(tk.Tk):
 		self._session_file: Optional[Path] = None
 		self._last_mark_action: Optional[Tuple[str, str, int]] = None  # (name, action, index) for Ctrl+Z undo
 
+		# External media player (user-specified or auto-detected VLC)
+		self.config = load_app_config()
+		self.media_player: Optional[str] = self.config.get("media_player") or find_default_media_player()
+
 		# Modes: 'viewer' or 'gallery'
 		self.mode: str = "viewer"
 		# Thumbnails
@@ -251,9 +283,10 @@ class PicCullApp(tk.Tk):
 		self.btn_unmark_all = ttk.Button(top, text="Unmark All", command=self.unmark_all, takefocus=False)
 		self.btn_apply = ttk.Button(top, text="Apply (0)", command=self.apply_marks, takefocus=False)
 		self.btn_mode = ttk.Button(top, text="Gallery", command=self.toggle_gallery, takefocus=False)
+		self.btn_player = ttk.Button(top, text="Player", command=self.configure_player, takefocus=False)
 
 		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_mark,
-				  self.btn_unmark_all, self.btn_apply, self.btn_mode):
+				  self.btn_unmark_all, self.btn_apply, self.btn_mode, self.btn_player):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
 		# Thumbnail size control (Gallery-only panel)
@@ -1001,38 +1034,72 @@ class PicCullApp(tk.Tk):
 		)
 
 	def _draw_video_badge(self) -> None:
-		"""Draw video indicator in viewer canvas if current media is a video."""
+		"""Draw media player indicator in viewer canvas if current media is video or HEIC."""
 		self.canvas.delete("video_badge")
 		if not self.images or self.index < 0:
 			return
-		if not is_video(self.images[self.index]):
+		cur = self.images[self.index]
+		is_vid = is_video(cur)
+		is_heic = cur.suffix.lower() in {".heic", ".heif", ".hif"}
+		if not is_vid and not is_heic:
 			return
 		ch = self.canvas.winfo_height() or 600
+		p_name = Path(self.media_player).stem.upper() if self.media_player else "PLAYER"
+		label_type = "VIDEO" if is_vid else cur.suffix.upper()[1:]
 		self.canvas.create_text(
 			20,
 			ch - 24,
-			text="▶ VIDEO  (Double-click or press P to play)",
+			text=f"▶ {label_type}  (Double-click or press P to open in {p_name})",
 			fill=self.colors["fg"],
 			font=self.small_font,
 			anchor="w",
 			tags="video_badge",
 		)
 
-	def play_current_video(self) -> None:
-		"""Open current video in system default player."""
+	def configure_player(self) -> None:
+		"""Open dialog to configure user-specified media player executable."""
+		initial_dir = r"C:\Program Files\VideoLAN\VLC" if sys.platform.startswith("win") else None
+		chosen = filedialog.askopenfilename(
+			title="Select Media Player (e.g. VLC)",
+			initialdir=initial_dir if initial_dir and Path(initial_dir).exists() else None,
+			filetypes=[("Executables", "*.exe"), ("All Files", "*.*")] if sys.platform.startswith("win") else [("All Files", "*.*")],
+		)
+		self.focus_set()
+		if chosen:
+			self.media_player = chosen
+			self.config["media_player"] = chosen
+			save_app_config(self.config)
+			name = Path(chosen).name
+			self._set_status(extra=f"Player set to {name}")
+			if self.mode == "viewer":
+				self._draw_video_badge()
+
+	def open_in_player(self) -> None:
+		"""Open current media file in user-specified media player or system default."""
 		if not self.images or self.index < 0:
 			return
 		cur = self.images[self.index]
-		if is_video(cur) and cur.exists():
+		if not cur.exists():
+			return
+		player = self.media_player
+		if player and Path(player).is_file():
 			try:
-				if sys.platform.startswith("win"):
-					os.startfile(str(cur))
-				elif sys.platform == "darwin":
-					subprocess.Popen(["open", str(cur)])
-				else:
-					subprocess.Popen(["xdg-open", str(cur)])
+				subprocess.Popen([player, str(cur)])
+				return
 			except Exception as e:
-				messagebox.showerror("Error playing video", str(e))
+				messagebox.showerror("Error launching player", f"Failed to open with {player}:\n{e}")
+		# Fallback to system default association
+		try:
+			if sys.platform.startswith("win"):
+				os.startfile(str(cur))
+			elif sys.platform == "darwin":
+				subprocess.Popen(["open", str(cur)])
+			else:
+				subprocess.Popen(["xdg-open", str(cur)])
+		except Exception as e:
+			messagebox.showerror("Error opening file", str(e))
+
+	play_current_video = open_in_player
 
 	def _clear_arrow_items(self) -> None:
 		if self._left_arrow_id is not None:
