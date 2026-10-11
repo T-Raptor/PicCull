@@ -17,7 +17,7 @@ except ImportError:
 	)
 
 
-IMG_EXTS = {".jpg", ".jpeg", ".png"}
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 def is_image(path: Path) -> bool:
@@ -66,6 +66,8 @@ class PicCullApp(tk.Tk):
 			"border": "#2A2A2A",
 		}
 
+		# Track any Windows private fonts we load to remove on exit
+		self._win_private_fonts: list[Path] = []
 		# Fonts: prefer JetBrains Mono (bundled or system), then fallbacks
 		self.font_family = self._pick_font_family()
 		self.base_font = (self.font_family, 11)
@@ -108,8 +110,6 @@ class PicCullApp(tk.Tk):
 		# UI
 		self._build_ui()
 		self._bind_keys()
-		# Track any Windows private fonts we load to remove on exit
-		self._win_private_fonts: list[Path] = []
 
 	def _setup_style(self) -> None:
 		style = ttk.Style(self)
@@ -794,7 +794,7 @@ class PicCullApp(tk.Tk):
 		self._layout_gallery()
 		self._maybe_trigger_load_more()
 
-	def _on_global_mouse_wheel(self, event) -> str | None:
+	def _on_global_mouse_wheel(self, event) -> Optional[str]:
 		"""Global wheel handler.
 		- In Gallery: scroll the gallery canvas regardless of focus if pointer is within it.
 		- In Viewer: wheel navigates prev/next when pointer is over the viewer canvas.
