@@ -53,3 +53,6 @@ venv/
 Thumbs.db
 Desktop.ini
 
+# Agent
+.agents/
+skills-lock.json
