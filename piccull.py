@@ -35,6 +35,7 @@ IMG_EXTS = {
 VID_EXTS = {
 	".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".flv",
 }
+MEDIA_EXTS = IMG_EXTS | VID_EXTS
 SESSION_FILENAME = ".piccull_session.json"
 
 
