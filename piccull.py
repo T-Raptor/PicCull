@@ -1,8 +1,9 @@
+import json
 import os
 import sys
 import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -18,14 +19,18 @@ except ImportError:
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+SESSION_FILENAME = ".piccull_session.json"
 
 
 def is_image(path: Path) -> bool:
-	return path.suffix.lower() in IMG_EXTS
+	return path.suffix.lower() in IMG_EXTS and not path.name.startswith(".")
 
 
 def list_images(folder: Path) -> List[Path]:
-	return sorted([p for p in folder.iterdir() if p.is_file() and is_image(p)], key=lambda p: p.name.lower())
+	return sorted(
+		[p for p in folder.iterdir() if p.is_file() and is_image(p)],
+		key=lambda p: p.name.lower(),
+	)
 
 
 def ensure_deleted_folder(base: Path) -> Path:
@@ -64,6 +69,7 @@ class PicCullApp(tk.Tk):
 			"muted": "#888888",
 			"panel": "#1A1A1A",
 			"border": "#2A2A2A",
+			"marked": "#C8A400",   # amber — marked tile border / badge
 		}
 
 		# Track any Windows private fonts we load to remove on exit
@@ -83,11 +89,14 @@ class PicCullApp(tk.Tk):
 		self.current_image_pil: Optional[Image.Image] = None
 		self.current_photo: Optional[ImageTk.PhotoImage] = None
 		self._resize_after_id: Optional[str] = None
-		# Undo: (original_parent, moved_to_path, original_index, original_name)
-		self._last_deleted: Optional[Tuple[Path, Path, int, str]] = None
 		# Canvas arrow items
 		self._left_arrow_id: Optional[int] = None
 		self._right_arrow_id: Optional[int] = None
+
+		# Marking state
+		self.marked: set[str] = set()          # filenames (not paths) currently marked
+		self._session_file: Optional[Path] = None
+		self._last_mark_action: Optional[Tuple[str, str, int]] = None  # (name, action, index) for Ctrl+Z undo
 
 		# Modes: 'viewer' or 'gallery'
 		self.mode: str = "viewer"
@@ -163,11 +172,13 @@ class PicCullApp(tk.Tk):
 		self.btn_open = ttk.Button(top, text="Open", command=self.choose_folder)
 		self.btn_prev = ttk.Button(top, text="Prev", command=self.prev_image)
 		self.btn_next = ttk.Button(top, text="Next", command=self.next_image)
-		self.btn_delete = ttk.Button(top, text="Delete", command=self.delete_current)
-		self.btn_undo = ttk.Button(top, text="Undo", command=self.undo_last_delete)
+		self.btn_mark = ttk.Button(top, text="Mark", command=self.toggle_mark)
+		self.btn_unmark_all = ttk.Button(top, text="Unmark All", command=self.unmark_all)
+		self.btn_apply = ttk.Button(top, text="Apply (0)", command=self.apply_marks)
 		self.btn_mode = ttk.Button(top, text="Gallery", command=self.toggle_gallery)
 
-		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_delete, self.btn_undo, self.btn_mode):
+		for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_mark,
+				  self.btn_unmark_all, self.btn_apply, self.btn_mode):
 			w.pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
 		# Thumbnail size control (Gallery-only panel)
@@ -211,6 +222,9 @@ class PicCullApp(tk.Tk):
 		self.counter_label.pack(side=tk.LEFT, padx=(8, 0), pady=6)
 		self.status_label = ttk.Label(bottom, text="Pick a folder to begin", style="Muted.TLabel")
 		self.status_label.pack(side=tk.LEFT, padx=8, pady=6)
+		# Marked count shown right-aligned in status bar
+		self.marked_label = ttk.Label(bottom, text="", style="Muted.TLabel")
+		self.marked_label.pack(side=tk.RIGHT, padx=(0, 8), pady=6)
 
 		self._update_controls()
 
@@ -275,17 +289,63 @@ class PicCullApp(tk.Tk):
 		self.bind("<Escape>", lambda e: self.destroy())
 		self.bind("<Left>", lambda e: self.prev_image())
 		self.bind("<Right>", lambda e: self.next_image())
-		self.bind("<Delete>", lambda e: self.delete_current())
+		self.bind("<Delete>", lambda e: self.toggle_mark())
+		self.bind("<space>", lambda e: self.toggle_mark())
 		self.bind("<Return>", lambda e: self._on_enter_key())
-		self.bind("<space>", lambda e: self._on_enter_key())
 		self.bind("<Up>", lambda e: self._move_selection_up())
 		self.bind("<Down>", lambda e: self._move_selection_down())
-		# Undo: Ctrl+Z
-		self.bind("<Control-z>", lambda e: self.undo_last_delete())
+		# Ctrl+Z: undo last mark toggle
+		self.bind("<Control-z>", lambda e: self._undo_last_mark())
+		# Ctrl+Return: open apply dialog
+		self.bind("<Control-Return>", lambda e: self.apply_marks())
 		# Global mouse wheel: scroll gallery anywhere; in viewer, wheel navigates
 		self.bind_all("<MouseWheel>", self._on_global_mouse_wheel, add=True)
 
+	# ----- Session persistence -----
+
+	def _load_session(self) -> None:
+		"""Load marked set from .piccull_session.json if it exists for the current folder."""
+		if self.folder is None:
+			return
+		self._session_file = self.folder / SESSION_FILENAME
+		if self._session_file.exists():
+			try:
+				data = json.loads(self._session_file.read_text(encoding="utf-8"))
+				raw_marked = set(data.get("marked", []))
+				# Prune filenames that no longer exist on disk
+				existing = {p.name for p in self.images}
+				self.marked = raw_marked & existing
+			except Exception:
+				self.marked = set()
+		else:
+			self.marked = set()
+		self._last_mark_action = None
+
+	def _save_session(self) -> None:
+		"""Write current mark state to disk immediately."""
+		if self._session_file is None or self.folder is None:
+			return
+		data = {
+			"version": 1,
+			"folder": str(self.folder),
+			"marked": sorted(self.marked),
+		}
+		try:
+			self._session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+		except Exception:
+			pass
+
+	def _delete_session_file(self) -> None:
+		"""Remove the session file after a successful apply."""
+		if self._session_file and self._session_file.exists():
+			try:
+				self._session_file.unlink()
+			except Exception:
+				pass
+		self._session_file = None
+
 	# ----- Image / folder management -----
+
 	def choose_folder(self) -> None:
 		path = filedialog.askdirectory(title="Select image folder")
 		if not path:
@@ -295,12 +355,28 @@ class PicCullApp(tk.Tk):
 		self.folder = folder
 		self.images = imgs
 		self.index = 0 if imgs else -1
-		self._last_deleted = None
+		self._load_session()
 		self._set_status()
 		self._show_current()
 		self._update_controls()
 		# Rebuild gallery content if needed
 		self._rebuild_gallery()
+
+	def _refresh_image_list(self) -> None:
+		"""Re-scan the folder, update image list, clamp index, refresh UI."""
+		if self.folder is None:
+			return
+		self.images = list_images(self.folder)
+		if self.images:
+			self.index = max(0, min(self.index, len(self.images) - 1))
+		else:
+			self.index = -1
+		self._set_status()
+		if self.mode == "viewer":
+			self._show_current()
+		else:
+			self._rebuild_gallery()
+		self._update_controls()
 
 	def _set_status(self, extra: str = "") -> None:
 		if self.index == -1 or not self.images:
@@ -316,12 +392,18 @@ class PicCullApp(tk.Tk):
 			self.status_label.configure(text=text)
 		else:
 			im_path = self.images[self.index]
+			is_marked = im_path.name in self.marked
 			counter = f"{self.index + 1}/{len(self.images)}"
 			info = f" — {im_path.name}"
+			if is_marked:
+				info = f"{info}  ●"
 			if extra:
 				info = f"{info}  |  {extra}"
 			self.counter_label.configure(text=counter)
 			self.status_label.configure(text=info)
+		# Marked count in right side of status bar
+		n = len(self.marked)
+		self.marked_label.configure(text=(f"{n} marked" if n > 0 else ""))
 
 	def _update_controls(self) -> None:
 		has_images = bool(self.images)
@@ -331,8 +413,19 @@ class PicCullApp(tk.Tk):
 		# Prev/Next enabled based on edges (no wrap)
 		self.btn_prev.configure(state=(tk.NORMAL if (has_images and not at_first) else tk.DISABLED))
 		self.btn_next.configure(state=(tk.NORMAL if (has_images and not at_last) else tk.DISABLED))
-		self.btn_delete.configure(state=(tk.NORMAL if has_images else tk.DISABLED))
-		self.btn_undo.configure(state=(tk.NORMAL if self._last_deleted else tk.DISABLED))
+		self.btn_mark.configure(state=(tk.NORMAL if has_images else tk.DISABLED))
+		self.btn_unmark_all.configure(state=(tk.NORMAL if self.marked else tk.DISABLED))
+		self.btn_apply.configure(
+			state=(tk.NORMAL if self.marked else tk.DISABLED),
+			text=f"Apply ({len(self.marked)})",
+		)
+
+		# Update Mark button label to reflect current image state
+		if has_images and self.images and 0 <= self.index < len(self.images):
+			cur_name = self.images[self.index].name
+			self.btn_mark.configure(text=("Unmark" if cur_name in self.marked else "Mark"))
+		else:
+			self.btn_mark.configure(text="Mark")
 
 		# Bind/unbind counter click for jump
 		try:
@@ -461,81 +554,222 @@ class PicCullApp(tk.Tk):
 			self._ensure_selected_visible()
 		self._update_controls()
 
-	def delete_current(self) -> None:
-		if not self.images:
-			return
-		cur = self.images[self.index]
-		try:
-			target_dir = ensure_deleted_folder(cur.parent)
-			moved_to = safe_move_to_deleted(cur, target_dir)
-			# Remove from list and adjust index
-			original_index = self.index
-			original_parent = cur.parent
-			original_name = cur.name
-			del self.images[self.index]
-			# Purge any thumbnails for this path from cache (all sizes)
-			self._purge_thumb_cache_for_path(cur)
-			# Prepare undo info
-			self._last_deleted = (original_parent, Path(moved_to), original_index, original_name)
+	# ----- Marking -----
 
-			if self.images:
-				# Clamp to last element if we deleted last
-				self.index = min(self.index, len(self.images) - 1)
-			else:
-				self.index = -1
-			# Build a friendly path string; prefer relative to chosen folder if available
-			rel_display = moved_to.name
-			if self.folder is not None:
-				try:
-					rel_display = str(moved_to.relative_to(self.folder))
-				except Exception:
-					rel_display = moved_to.name
-			self._set_status(extra=f"Moved to {rel_display}")
-			if self.mode == "viewer":
-				self._show_current()
-			else:
-				# Rebuild gallery grid after delete
-				self._rebuild_gallery()
-			self._update_controls()
-		except Exception as e:
-			messagebox.showerror("Error", f"Failed to move file:\n{e}")
-
-	def undo_last_delete(self) -> None:
-		if not self._last_deleted:
+	def toggle_mark(self) -> None:
+		"""Toggle mark on the current image and advance to next."""
+		if not self.images or self.index < 0:
 			return
-		original_parent, moved_to, original_index, original_name = self._last_deleted
-		try:
-			# Compute restore destination with collision-safe naming
-			dest = original_parent / original_name
-			if dest.exists():
-				stem, ext = Path(original_name).stem, Path(original_name).suffix
-				i = 1
-				while True:
-					candidate = original_parent / f"{stem}-restored-{i}{ext}"
-					if not candidate.exists():
-						dest = candidate
-						break
-					i += 1
-			shutil.move(str(moved_to), str(dest))
-			# Insert back into list near original index (clamped)
-			insert_at = max(0, min(original_index, len(self.images)))
-			self.images.insert(insert_at, dest)
-			self.index = insert_at
-			self._last_deleted = None
-			# Update UI
-			rel_display = dest.name
-			if self.folder is not None:
-				try:
-					rel_display = str(dest.relative_to(self.folder))
-				except Exception:
-					rel_display = dest.name
-			self._set_status(extra=f"Restored {rel_display}")
+		cur_idx = self.index
+		name = self.images[cur_idx].name
+		if name in self.marked:
+			self.marked.discard(name)
+			self._last_mark_action = (name, "unmarked", cur_idx)
+		else:
+			self.marked.add(name)
+			self._last_mark_action = (name, "marked", cur_idx)
+		self._save_session()
+		self._set_status()
+		self._update_controls()
+		if self.mode == "gallery":
+			self._update_selection_highlight()
+		elif self.mode == "viewer":
+			self._draw_mark_badge()
+		# Auto-advance after marking (preserves the rapid-fire culling rhythm)
+		self.next_image()
+
+	def _undo_last_mark(self) -> None:
+		"""Undo the last mark/unmark toggle and return to that image."""
+		if not self._last_mark_action:
+			return
+		name, action, prev_idx = self._last_mark_action
+		self._last_mark_action = None
+		if action == "marked":
+			self.marked.discard(name)
+		else:
+			self.marked.add(name)
+		self._save_session()
+		if 0 <= prev_idx < len(self.images) and self.images[prev_idx].name == name:
+			self.index = prev_idx
+		self._set_status()
+		self._update_controls()
+		if self.mode == "gallery":
+			self._update_selection_highlight()
+			self._ensure_selected_visible()
+		elif self.mode == "viewer":
 			self._show_current()
-			self._update_controls()
+
+	def unmark_all(self) -> None:
+		"""Clear all marks, with confirmation if count > 0."""
+		if not self.marked:
+			return
+		n = len(self.marked)
+		if not messagebox.askyesno(
+			"Unmark All",
+			f"Clear all {n} marked image{'s' if n != 1 else ''}?",
+			default="no",
+		):
+			return
+		self.marked.clear()
+		self._last_mark_action = None
+		self._save_session()
+		self._set_status()
+		self._update_controls()
+		if self.mode == "gallery":
+			self._update_selection_highlight()
+		elif self.mode == "viewer":
+			self._draw_mark_badge()
+
+	# ----- Apply -----
+
+	def apply_marks(self) -> None:
+		"""Open apply dialog and execute the chosen batch operation."""
+		if not self.marked or self.folder is None:
+			return
+
+		n_marked = len(self.marked)
+		n_total = len(self.images)
+		n_unmarked = n_total - n_marked
+
+		choice = self._ask_apply_action(n_marked, n_unmarked)
+		if choice is None:
+			return
+
+		errors: List[str] = []
+
+		try:
+			if choice == "delete_marked":
+				dest = ensure_deleted_folder(self.folder)
+				moved_names = set()
+				for name in list(self.marked):
+					src = self.folder / name
+					if src.exists():
+						try:
+							safe_move_to_deleted(src, dest)
+							moved_names.add(name)
+						except Exception as e:
+							errors.append(f"{name}: {e}")
+					else:
+						moved_names.add(name)
+				self._purge_thumb_cache_for_names(moved_names)
+				self.marked -= moved_names
+
+			elif choice == "keep_marked":
+				dest = ensure_deleted_folder(self.folder)
+				unmarked = {p.name for p in self.images} - self.marked
+				moved_names = set()
+				for name in unmarked:
+					src = self.folder / name
+					if src.exists():
+						try:
+							safe_move_to_deleted(src, dest)
+							moved_names.add(name)
+						except Exception as e:
+							errors.append(f"{name}: {e}")
+					else:
+						moved_names.add(name)
+				self._purge_thumb_cache_for_names(moved_names)
+				self.marked.clear()
+
+			elif choice == "copy_marked":
+				target = filedialog.askdirectory(title="Copy marked images to…")
+				if not target:
+					return
+				target_dir = Path(target)
+				copied_names = set()
+				for name in list(self.marked):
+					src = self.folder / name
+					if src.exists():
+						try:
+							shutil.copy2(str(src), str(target_dir / name))
+							copied_names.add(name)
+						except Exception as e:
+							errors.append(f"{name}: {e}")
+				self.marked -= copied_names
+
 		except Exception as e:
-			messagebox.showerror("Error", f"Failed to restore file:\n{e}")
+			messagebox.showerror("Apply failed", str(e))
+			return
+
+		self._last_mark_action = None
+		if not self.marked:
+			self._delete_session_file()
+		else:
+			self._save_session()
+		self._refresh_image_list()
+
+		if errors:
+			messagebox.showwarning(
+				"Apply completed with errors",
+				f"{len(errors)} file(s) failed:\n" + "\n".join(errors[:10]),
+			)
+
+	def _ask_apply_action(self, n_marked: int, n_unmarked: int) -> Optional[str]:
+		"""Minimalist modal to choose how to apply marks. Returns action key or None."""
+		top = tk.Toplevel(self)
+		top.title("Apply marks")
+		top.configure(bg=self.colors["panel"])
+		top.transient(self)
+		top.resizable(False, False)
+		top.grab_set()
+
+		frm = ttk.Frame(top, style="Panel.TFrame", padding=16)
+		frm.pack(fill=tk.BOTH, expand=True)
+
+		ttk.Label(frm, text=f"What to do with {n_marked} marked image{'s' if n_marked != 1 else ''}?",
+				  style="TLabel").pack(anchor="w", pady=(0, 12))
+
+		result: dict[str, Optional[str]] = {"value": None}
+
+		def pick(val: str) -> None:
+			result["value"] = val
+			top.destroy()
+
+		btn_del = ttk.Button(
+			frm,
+			text=f"Move {n_marked} marked  →  .deleted/",
+			command=lambda: pick("delete_marked"),
+		)
+		btn_del.pack(fill=tk.X, pady=(0, 6))
+
+		def _confirm_keep_fn() -> None:
+			if messagebox.askyesno(
+				"Confirm keep",
+				f"This will move {n_unmarked} unmarked image{'s' if n_unmarked != 1 else ''} to .deleted/.\nContinue?",
+				default="no",
+				parent=top,
+			):
+				pick("keep_marked")
+
+		# "Keep only marked" deletes many files — show the count clearly
+		btn_keep = ttk.Button(
+			frm,
+			text=f"Keep {n_marked} marked, move {n_unmarked} others  →  .deleted/",
+			command=_confirm_keep_fn,
+		)
+		btn_keep.pack(fill=tk.X, pady=(0, 6))
+
+		btn_copy = ttk.Button(
+			frm,
+			text=f"Copy {n_marked} marked  →  choose folder…",
+			command=lambda: pick("copy_marked"),
+		)
+		btn_copy.pack(fill=tk.X, pady=(0, 12))
+
+		ttk.Button(frm, text="Cancel", command=top.destroy).pack(anchor="e")
+
+		# Center over app
+		top.update_idletasks()
+		x = self.winfo_rootx() + (self.winfo_width() // 2 - top.winfo_width() // 2)
+		y = self.winfo_rooty() + (self.winfo_height() // 2 - top.winfo_height() // 2)
+		top.geometry(f"+{max(0, x)}+{max(0, y)}")
+		top.bind("<Escape>", lambda e: top.destroy())
+
+		top.wait_window()
+		return result["value"]
 
 	# ----- Rendering -----
+
 	def _show_current(self) -> None:
 		self.canvas.delete("all")
 		self.current_image_pil = None
@@ -601,6 +835,26 @@ class PicCullApp(tk.Tk):
 		self.canvas.delete("all")
 		self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo, anchor="center")
 		self._draw_arrows()
+		self._draw_mark_badge()
+
+	def _draw_mark_badge(self) -> None:
+		"""Draw a small amber dot in the top-right corner when current image is marked."""
+		# Remove any existing badge
+		self.canvas.delete("mark_badge")
+		if not self.images or self.index < 0:
+			return
+		if self.images[self.index].name not in self.marked:
+			return
+		cw = self.canvas.winfo_width() or 800
+		r = 10
+		pad = 14
+		x, y = cw - pad, pad
+		self.canvas.create_oval(
+			x - r, y - r, x + r, y + r,
+			fill=self.colors["marked"],
+			outline="",
+			tags="mark_badge",
+		)
 
 	def _clear_arrow_items(self) -> None:
 		if self._left_arrow_id is not None:
@@ -656,6 +910,7 @@ class PicCullApp(tk.Tk):
 			self.canvas.tag_bind(self._right_arrow_id, "<Leave>", lambda e: self.canvas.config(cursor=""))
 
 	# ---------- Gallery UI ----------
+
 	def _build_gallery_ui(self) -> None:
 		self._gallery_container = ttk.Frame(self.view_area, style="TFrame")
 		# Canvas and vertical scrollbar
@@ -729,12 +984,14 @@ class PicCullApp(tk.Tk):
 		self._ensure_selected_visible()
 
 	def _create_tile(self, parent: tk.Misc, index: int, path: Path) -> tk.Frame:
+		is_marked = path.name in self.marked
+		border_color = self.colors["marked"] if is_marked else self.colors["border"]
 		# Outer frame as border
-		outer = tk.Frame(parent, bg=self.colors["border"])
+		outer = tk.Frame(parent, bg=border_color)
 		inner = tk.Frame(outer, bg=self.colors["panel"])  # image background
-		inner.pack(padx=1, pady=1)
+		inner.pack(padx=2, pady=2)
 		thumb = self._get_thumbnail(path)
-		lbl = tk.Label(inner, image=thumb, bg=self.colors["panel"]) 
+		lbl = tk.Label(inner, image=thumb, bg=self.colors["panel"])
 		lbl.pack()
 		# Mouse bindings
 		def on_click(_e=None, i=index):
@@ -742,15 +999,32 @@ class PicCullApp(tk.Tk):
 			self._update_selection_highlight()
 			self._set_status()
 			self._ensure_selected_visible()
+			self._update_controls()
 		def on_double(_e=None, i=index):
 			self.index = i
 			self._leave_gallery()
+		def on_right_click(_e=None, i=index):
+			self.index = i
+			name = self.images[i].name
+			if name in self.marked:
+				self.marked.discard(name)
+				self._last_mark_action = (name, "unmarked", i)
+			else:
+				self.marked.add(name)
+				self._last_mark_action = (name, "marked", i)
+			self._save_session()
+			self._set_status()
+			self._update_controls()
+			self._update_selection_highlight()
 		outer.bind("<Button-1>", on_click)
 		inner.bind("<Button-1>", on_click)
 		lbl.bind("<Button-1>", on_click)
 		outer.bind("<Double-Button-1>", on_double)
 		inner.bind("<Double-Button-1>", on_double)
 		lbl.bind("<Double-Button-1>", on_double)
+		outer.bind("<Button-3>", on_right_click)
+		inner.bind("<Button-3>", on_right_click)
+		lbl.bind("<Button-3>", on_right_click)
 		return outer
 
 	def _get_thumbnail(self, path: Path, size: Optional[int] = None) -> ImageTk.PhotoImage:
@@ -776,6 +1050,12 @@ class PicCullApp(tk.Tk):
 	def _purge_thumb_cache_for_path(self, path: Path) -> None:
 		# Remove all sizes for a given path from cache
 		to_delete = [k for k in self.thumb_cache.keys() if k[0] == path]
+		for k in to_delete:
+			self.thumb_cache.pop(k, None)
+
+	def _purge_thumb_cache_for_names(self, names: set[str]) -> None:
+		"""Remove all cached thumbnails whose filename is in names."""
+		to_delete = [k for k in self.thumb_cache.keys() if k[0].name in names]
 		for k in to_delete:
 			self.thumb_cache.pop(k, None)
 
@@ -846,7 +1126,7 @@ class PicCullApp(tk.Tk):
 			return
 		cw = max(1, self.gallery_canvas.winfo_width())
 		gap = 16
-		tile_w = self.thumb_size + 2 + 2  # inner + border padding
+		tile_w = self.thumb_size + 4 + 4  # inner + border padding (2px each side)
 		cols = max(1, (cw - gap) // (tile_w + gap))
 		# Place any already-created tiles; placeholders will be skipped
 		for i, tile in enumerate(self._gallery_tiles):
@@ -860,13 +1140,33 @@ class PicCullApp(tk.Tk):
 			self.gallery_frame.grid_columnconfigure(c, weight=1)
 
 	def _update_selection_highlight(self) -> None:
+		"""Update gallery tile borders: marked=amber, selected=white, both=amber+thick, neither=dark."""
 		if not self._gallery_tiles:
 			return
 		for i, tile in enumerate(self._gallery_tiles):
 			if tile is None:
 				continue
-			bg = self.colors["fg"] if i == self.index else self.colors["border"]
-			tile.configure(bg=bg)
+			is_selected = (i == self.index)
+			is_marked = (
+				i < len(self.images) and self.images[i].name in self.marked
+			)
+			if is_marked and is_selected:
+				tile.configure(bg=self.colors["marked"])
+				# Thicker border signals both marked and selected
+				for child in tile.winfo_children():
+					child.pack_configure(padx=4, pady=4)
+			elif is_marked:
+				tile.configure(bg=self.colors["marked"])
+				for child in tile.winfo_children():
+					child.pack_configure(padx=2, pady=2)
+			elif is_selected:
+				tile.configure(bg=self.colors["fg"])
+				for child in tile.winfo_children():
+					child.pack_configure(padx=2, pady=2)
+			else:
+				tile.configure(bg=self.colors["border"])
+				for child in tile.winfo_children():
+					child.pack_configure(padx=2, pady=2)
 
 	def _ensure_selected_visible(self) -> None:
 		if not self.gallery_canvas or not self._gallery_tiles or not (0 <= self.index < len(self._gallery_tiles)):
@@ -876,7 +1176,7 @@ class PicCullApp(tk.Tk):
 		# Compute target row and approximate y position and scroll to it
 		cw = max(1, self.gallery_canvas.winfo_width())
 		gap = 16
-		tile_w = self.thumb_size + 2 + 2
+		tile_w = self.thumb_size + 4 + 4
 		cols = max(1, (cw - gap) // (tile_w + gap))
 		row = self.index // cols
 		row_height = self.thumb_size + gap + 4
@@ -929,7 +1229,7 @@ class PicCullApp(tk.Tk):
 		# Compute target row and approximate y position
 		cw = max(1, self.gallery_canvas.winfo_width())
 		gap = 16
-		tile_w = self.thumb_size + 2 + 2
+		tile_w = self.thumb_size + 4 + 4
 		cols = max(1, (cw - gap) // (tile_w + gap))
 		row = self.index // cols
 		row_height = self.thumb_size + gap + 4
@@ -941,6 +1241,7 @@ class PicCullApp(tk.Tk):
 		self.gallery_canvas.yview_moveto(max(0.0, min(1.0, y / max_y)))
 
 	# ----- Thumbnail size handling -----
+
 	def _snap_thumb(self, v: int) -> int:
 		# Snap around 96..384 using large steps
 		lo, hi, step = 96, 384, self.thumb_step
@@ -972,6 +1273,8 @@ class PicCullApp(tk.Tk):
 			self._rebuild_gallery()
 
 	def _on_close(self) -> None:
+		# Save session before exit so marks are never lost
+		self._save_session()
 		# Clear session caches (in-memory only) and exit
 		try:
 			self.thumb_cache.clear()
@@ -995,7 +1298,7 @@ class PicCullApp(tk.Tk):
 			return
 		cw = max(1, self.gallery_canvas.winfo_width()) if self.gallery_canvas else 1
 		gap = 16
-		tile_w = self.thumb_size + 2 + 2
+		tile_w = self.thumb_size + 4 + 4
 		cols = max(1, (cw - gap) // (tile_w + gap))
 		self.index = max(0, self.index - cols)
 		self._set_status()
@@ -1008,7 +1311,7 @@ class PicCullApp(tk.Tk):
 			return
 		cw = max(1, self.gallery_canvas.winfo_width()) if self.gallery_canvas else 1
 		gap = 16
-		tile_w = self.thumb_size + 2 + 2
+		tile_w = self.thumb_size + 4 + 4
 		cols = max(1, (cw - gap) // (tile_w + gap))
 		self.index = min(len(self.images) - 1, self.index + cols)
 		self._set_status()
@@ -1024,4 +1327,3 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-
