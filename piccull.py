@@ -1,3 +1,4 @@
+import concurrent.futures
 import io
 import json
 import os
@@ -56,21 +57,21 @@ def list_images(folder: Path) -> List[Path]:
 def extract_video_frame(path: Path) -> Image.Image:
 	"""Extract video poster frame via ffmpeg or generate fallback placeholder."""
 	creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
-	for args in (["-ss", "0.1", "-i", str(path)], ["-i", str(path)]):
-		try:
-			cmd = ["ffmpeg", *args, "-vframes", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
-			proc = subprocess.run(
-				cmd,
-				stdout=subprocess.PIPE,
-				stderr=subprocess.DEVNULL,
-				creationflags=creationflags,
-				timeout=6,
-			)
-			if proc.stdout:
-				img = Image.open(io.BytesIO(proc.stdout))
-				return ImageOps.exif_transpose(img)
-		except Exception:
-			pass
+	# Use fast input seeking and mjpeg pipe (3-5x faster than png encoding)
+	cmd = ["ffmpeg", "-ss", "0.1", "-i", str(path), "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"]
+	try:
+		proc = subprocess.run(
+			cmd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			creationflags=creationflags,
+			timeout=3,
+		)
+		if proc.stdout:
+			img = Image.open(io.BytesIO(proc.stdout))
+			return ImageOps.exif_transpose(img)
+	except Exception:
+		pass
 
 	# Fallback placeholder when ffmpeg cannot extract
 	ph = Image.new("RGB", (640, 360), color=(26, 26, 26))
@@ -79,13 +80,21 @@ def extract_video_frame(path: Path) -> Image.Image:
 	return ph
 
 
-def load_media_image(path: Path) -> Image.Image:
-	"""Load image or extract video/HEIC poster frame."""
+def load_media_image(path: Path, max_size: Optional[Tuple[int, int]] = None) -> Image.Image:
+	"""Load image or extract video/HEIC poster frame with fast draft downsampling."""
 	if is_video(path):
 		return extract_video_frame(path)
 	try:
-		img = Image.open(path)
-		return ImageOps.exif_transpose(img)
+		with Image.open(path) as img:
+			# Fast draft mode for JPEG to decode directly at lower resolution in libjpeg
+			if max_size and path.suffix.lower() in {".jpg", ".jpeg"}:
+				try:
+					img.draft("RGB", (max_size[0] * 2, max_size[1] * 2))
+				except Exception:
+					pass
+			transposed = ImageOps.exif_transpose(img)
+			transposed.load()
+			return transposed
 	except Exception:
 		# Fall back to ffmpeg if Pillow cannot decode (e.g. HEIC without pillow-heif)
 		if path.suffix.lower() in {".heic", ".heif", ".hif"}:
@@ -154,6 +163,10 @@ class PicCullApp(tk.Tk):
 		# Canvas arrow items
 		self._left_arrow_id: Optional[int] = None
 		self._right_arrow_id: Optional[int] = None
+
+		# Background prefetching and viewer image cache
+		self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+		self._viewer_pil_cache: dict[tuple[Path, int, int], Image.Image] = {}
 
 		# Marking state
 		self.marked: set[str] = set()          # filenames (not paths) currently marked
@@ -867,20 +880,82 @@ class PicCullApp(tk.Tk):
 			return
 
 		path = self.images[self.index]
+		cw = max(1, self.canvas.winfo_width())
+		ch = max(1, self.canvas.winfo_height())
+		cache_key = (path, cw, ch)
+
+		cached_pil = self._viewer_pil_cache.get(cache_key)
+		if cached_pil is not None:
+			self.current_image_pil = cached_pil
+			self._render_precomputed_to_canvas(cached_pil)
+		else:
+			try:
+				img = load_media_image(path, max_size=(cw, ch))
+				self.current_image_pil = img
+				img_w, img_h = img.size
+				scale = min(cw / img_w, ch / img_h)
+				new_w = max(1, int(img_w * scale))
+				new_h = max(1, int(img_h * scale))
+				resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+				self._cache_viewer_pil(cache_key, resized)
+				self._render_precomputed_to_canvas(resized)
+			except Exception as e:
+				self.canvas.create_text(
+					20,
+					20,
+					text=f"Error loading {path.name}: {e}",
+					fill="#FF5555",
+					anchor="nw",
+					font=self.small_font,
+				)
+				self._draw_arrows()
+
+		# Prefetch neighboring images in background thread
+		self._trigger_prefetch()
+
+	def _trigger_prefetch(self) -> None:
+		"""Prefetch neighboring images in a background thread for instant browsing."""
+		if not self.images or self.mode != "viewer":
+			return
+		cw = max(1, self.canvas.winfo_width())
+		ch = max(1, self.canvas.winfo_height())
+		for idx in (self.index + 1, self.index + 2, self.index - 1):
+			if 0 <= idx < len(self.images):
+				p = self.images[idx]
+				key = (p, cw, ch)
+				if key not in self._viewer_pil_cache:
+					self._executor.submit(self._bg_load_and_cache, p, cw, ch)
+
+	def _bg_load_and_cache(self, path: Path, cw: int, ch: int) -> None:
 		try:
-			img = load_media_image(path)
-			self.current_image_pil = img
-			self._render_to_canvas()
-		except Exception as e:
-			self.canvas.create_text(
-				20,
-				20,
-				text=f"Error loading {path.name}: {e}",
-				fill="#FF5555",
-				anchor="nw",
-				font=self.small_font,
-			)
-			self._draw_arrows()
+			key = (path, cw, ch)
+			if key in self._viewer_pil_cache:
+				return
+			img = load_media_image(path, max_size=(cw, ch))
+			img_w, img_h = img.size
+			scale = min(cw / img_w, ch / img_h)
+			new_w = max(1, int(img_w * scale))
+			new_h = max(1, int(img_h * scale))
+			resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+			self._cache_viewer_pil(key, resized)
+		except Exception:
+			pass
+
+	def _cache_viewer_pil(self, key: Tuple[Path, int, int], img: Image.Image) -> None:
+		if len(self._viewer_pil_cache) > 12:
+			oldest = next(iter(self._viewer_pil_cache))
+			self._viewer_pil_cache.pop(oldest, None)
+		self._viewer_pil_cache[key] = img
+
+	def _render_precomputed_to_canvas(self, resized: Image.Image) -> None:
+		canvas_w = max(1, self.canvas.winfo_width())
+		canvas_h = max(1, self.canvas.winfo_height())
+		self.current_photo = ImageTk.PhotoImage(resized)
+		self.canvas.delete("all")
+		self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo, anchor="center")
+		self._draw_arrows()
+		self._draw_mark_badge()
+		self._draw_video_badge()
 
 	def _on_canvas_resize(self, _event) -> None:
 		if self.mode != "viewer" or not self.current_image_pil:
@@ -903,14 +978,8 @@ class PicCullApp(tk.Tk):
 		scale = min(canvas_w / img_w, canvas_h / img_h)
 		new_w = max(1, int(img_w * scale))
 		new_h = max(1, int(img_h * scale))
-		resized = self.current_image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-		self.current_photo = ImageTk.PhotoImage(resized)
-
-		self.canvas.delete("all")
-		self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.current_photo, anchor="center")
-		self._draw_arrows()
-		self._draw_mark_badge()
-		self._draw_video_badge()
+		resized = self.current_image_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
+		self._render_precomputed_to_canvas(resized)
 
 	def _draw_mark_badge(self) -> None:
 		"""Draw a small amber dot in the top-right corner when current image is marked."""
@@ -1143,8 +1212,8 @@ class PicCullApp(tk.Tk):
 		if cached is not None:
 			return cached
 		try:
-			img = load_media_image(path)
-			img.thumbnail((s, s), Image.Resampling.LANCZOS)
+			img = load_media_image(path, max_size=(s, s))
+			img.thumbnail((s, s), Image.Resampling.BILINEAR)
 			if is_video(path):
 				# Overlay small play indicator badge on video thumbnail
 				draw = ImageDraw.Draw(img)
@@ -1171,12 +1240,18 @@ class PicCullApp(tk.Tk):
 		to_delete = [k for k in self.thumb_cache.keys() if k[0] == path]
 		for k in to_delete:
 			self.thumb_cache.pop(k, None)
+		v_delete = [k for k in self._viewer_pil_cache.keys() if k[0] == path]
+		for k in v_delete:
+			self._viewer_pil_cache.pop(k, None)
 
 	def _purge_thumb_cache_for_names(self, names: set[str]) -> None:
 		"""Remove all cached thumbnails whose filename is in names."""
 		to_delete = [k for k in self.thumb_cache.keys() if k[0].name in names]
 		for k in to_delete:
 			self.thumb_cache.pop(k, None)
+		v_delete = [k for k in self._viewer_pil_cache.keys() if k[0].name in names]
+		for k in v_delete:
+			self._viewer_pil_cache.pop(k, None)
 
 	def _on_gallery_frame_configure(self, _event=None) -> None:
 		if not self.gallery_canvas or not self.gallery_frame:
@@ -1397,6 +1472,8 @@ class PicCullApp(tk.Tk):
 		# Clear session caches (in-memory only) and exit
 		try:
 			self.thumb_cache.clear()
+			self._viewer_pil_cache.clear()
+			self._executor.shutdown(wait=False, cancel_futures=True)
 		except Exception:
 			pass
 		# Remove any private fonts we added on Windows
